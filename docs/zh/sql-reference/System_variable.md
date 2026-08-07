@@ -186,6 +186,13 @@ ALTER USER 'jack' SET PROPERTIES ('session.query_timeout' = '600');
 
 如果要在当前会话中激活一个角色，可以使用 [SET ROLE](sql-statements/account-management/SET_ROLE.md)。
 
+### ann_params
+
+* **描述**：指定近似最近邻（ANN）向量索引检索的查询参数。取值是键和值均为字符串的 JSON 对象字符串。HNSW 支持 `efsearch`；IVFPQ 支持 `nprobe`、`max_codes`、`scan_table_threshold`、`polysemous_ht` 和 `range_search_confidence`。可以在会话或单条语句中设置，例如 `SET ann_params = '{"efsearch":"256"}'` 或 `SET_VAR (ann_params='{"efsearch":"256"}')`。
+* **默认值**：`""`
+* **数据类型**：String
+* **作用域**：Session
+
 ### array_low_cardinality_optimize
 
 * **作用域**: Session
@@ -638,6 +645,27 @@ ALTER USER 'jack' SET PROPERTIES ('session.query_timeout' = '600');
 * 数据类型：Boolean
 * 引入版本：v3.5.16、v4.0.9
 
+### enable_lake_prepared_physical_split_scan
+
+* 描述：是否为存算分离集群中的云原生表开启 prepared physical split scan。开启后，每个 Segment 只裁剪一次，并在同一 Tablet 的各 split 子任务间共享裁剪后的读取状态，可加速大 Tablet 或数据倾斜 Tablet 的扫描。该优化按 Scan 节点决定是否生效，且要求表为云原生表并且未开启 Query Cache。仅在存算分离集群中生效。
+* 默认值：false
+* 类型：Boolean
+* 引入版本：v4.2
+
+### lake_tablet_internal_parallel_skew_split_ratio
+
+* 描述：数据倾斜阈值。在 prepared physical split scan 下，即使 scan range 数量已达到 pipeline DOP，仍可据此将单个超大 lake Tablet 拆分。当某个 Tablet 的行数超过本比值乘以每 driver 的理想份额（总行数除以有效 DOP）时，该 Tablet 被视为倾斜的长尾 Tablet 并被拆分。值越大，越需要更极端的倾斜才会拆分；值越小，越倾向于拆分。必须为正且有限的数值。仅对开启 `enable_lake_prepared_physical_split_scan` 的扫描生效，且仅在存算分离集群中生效。
+* 默认值：1.5
+* 类型：Double
+* 引入版本：v4.2
+
+### enable_lake_prepared_split_on_dup_table_scan
+
+* 描述：对于在同一查询中被两个及以上 Scan 算子扫描的云原生（lake）表（例如自连接，或被多次引用的表），是否允许对其使用 prepared physical split scan。默认值为 `false`，此时这类重复扫描回退为普通扫描，因为该优化按 Scan 复用的 prepared 读取状态在同一张表的多个兄弟 Scan 之间共享是不安全的。设为 `true` 可让这些扫描重新启用该优化。仅对开启 `enable_lake_prepared_physical_split_scan` 的扫描生效，且仅在存算分离集群中生效。
+* 默认值：false
+* 类型：Boolean
+* 引入版本：v4.2
+
 ### enable_lake_tablet_internal_parallel
 
 * 描述：是否开启存算分离集群内云原生表的 Tablet 并行 Scan.
@@ -957,6 +985,13 @@ ALTER USER 'jack' SET PROPERTIES ('session.query_timeout' = '600');
 * **数据类型**: boolean
 * **引入版本**: v3.2.4
 
+### enable_vector_index_refine
+
+* **描述**：是否基于原始向量重新计算量化向量索引返回候选项的精确距离，并重新排序。该变量适用于 IVFPQ 以及使用 `sq4`、`sq8` 或 `pq` 量化器的 HNSW 索引；对未量化的 HNSW 索引（`quantizer = flat`）无效。开启后可以提高结果准确性，但会增加 I/O 和计算开销。可以通过 `EXPLAIN` 中的 `Refine: ON/OFF` 确认是否生效。
+* **默认值**：`false`
+* **数据类型**：Boolean
+* **作用域**：Session
+
 ### enable_view_based_mv_rewrite
 
 * 描述：是否为基于逻辑视图创建的物化视图启用查询改写。如果此项设置为 `true`，则逻辑视图被用作统一节点进行查询改写，从而获得更好的性能。如果此项设置为 `false`，则系统将针对逻辑视图的查询展开变为针对物理表或物化视图的查询，然后进行改写。
@@ -1089,6 +1124,13 @@ ALTER USER 'jack' SET PROPERTIES ('session.query_timeout' = '600');
 * 默认值：1
 * 数据类型：Int
 * 引入版本：-
+
+### k_factor
+
+* **描述**：将查询的 `LIMIT` 乘以该值，得到每个 Segment 返回的向量索引候选数量。大于 `1` 的值可以提高多个 Segment 候选结果合并后的召回率，但会增加索引检索、内存和下游处理开销。最终候选数量至少为 `1`。
+* **默认值**：`1`
+* **数据类型**：Double
+* **作用域**：Session
 
 ### lake_bucket_assign_mode
 
@@ -1235,6 +1277,13 @@ ALTER USER 'jack' SET PROPERTIES ('session.query_timeout' = '600');
 * 默认值：3000
 * 单位：毫秒
 
+### one_tablet_opt_max_tablet_rows
+
+* 描述：按 tablet 大小控制单 tablet 优化。当查询被裁剪到单个 tablet 时，StarRocks 可将聚合合并为一阶段并在单个节点上汇聚结果，从而跳过 shuffle。这对小 tablet 很高效，但当 tablet 很大时会把整个查询串行化到单个节点上。如果所选单个 tablet 的行数超过该阈值，则禁用该优化，改用常规的分布式（shuffle）计划。设置为 `-1` 可禁用该门控，无论 tablet 大小都始终应用单 tablet 优化。
+* 默认值：10000000
+* 类型：Long
+* 引入版本：v4.2
+
 ### optimizer_materialized_view_timelimit
 
 * 描述：指定一个物化视图改写规则可消耗的最大时间。当达到阈值时，将不再使用该规则进行查询改写。
@@ -1337,6 +1386,13 @@ ALTER USER 'jack' SET PROPERTIES ('session.query_timeout' = '600');
   * `never` 永不缓存数据。
 * 默认值：auto
 * 引入版本：v3.3.2
+
+### pq_refine_factor
+
+* **描述**：启用 `enable_vector_index_refine` 后，向量范围查询使用的额外候选倍率。该值在 `k_factor` 之后生效。增大该值可以在精确距离重排前提高召回率，但会增加索引检索、I/O 和距离计算开销。
+* **默认值**：`1`
+* **数据类型**：Double
+* **作用域**：Session
 
 ### query_cache_agg_cardinality_limit
 

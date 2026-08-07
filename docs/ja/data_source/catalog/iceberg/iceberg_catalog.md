@@ -40,8 +40,8 @@ StarRocks を使用して Iceberg からデータをクエリする際には、�
 
 | **ファイル形式** | **圧縮形式**                                   | **Iceberg テーブルバージョン**                                           |
 | --------------- | ---------------------------------------------- | ------------------------------------------------------------ |
-| Parquet         | SNAPPY, LZ4, ZSTD, GZIP, NO_COMPRESSION      | <ul><li>v1 テーブル: サポートされています。 </li><li>v2 テーブル: StarRocks v3.1 以降でサポートされており、これらの v2 テーブルに対するクエリは位置削除をサポートします。v3.1.10、v3.2.5、v3.3 およびそれ以降のバージョンでは、v2 テーブルに対するクエリは等価削除もサポートします。 </li></ul> |
-| ORC             | ZLIB, SNAPPY, LZO, LZ4, ZSTD, NO_COMPRESSION | <ul><li>v1 テーブル: サポートされています。 </li><li>v2 テーブル: StarRocks v3.0 以降でサポートされており、これらの v2 テーブルに対するクエリは位置削除をサポートします。v3.1.8、v3.2.3、v3.3 およびそれ以降のバージョンでは、v2 テーブルに対するクエリは等価削除もサポートします。 </li></ul> |
+| Parquet         | SNAPPY, LZ4, ZSTD, GZIP, NO_COMPRESSION      | <ul><li>v1 テーブル: サポートされています。 </li><li>v2 テーブル: StarRocks v3.1 以降でサポートされており、これらの v2 テーブルに対するクエリは位置削除をサポートします。v3.1.10、v3.2.5、v3.3 およびそれ以降のバージョンでは、v2 テーブルに対するクエリは等価削除もサポートします。 </li><li>v3 テーブル: クエリはマージオンリード（merge-on-read）の削除ベクトル（v2 の位置削除ファイルを置き換える `deletion-vector-v1` Puffin blob）をサポートします。セッション変数 `enable_iceberg_v3_deletion_vector` で無効化できます。 </li></ul> |
+| ORC             | ZLIB, SNAPPY, LZO, LZ4, ZSTD, NO_COMPRESSION | <ul><li>v1 テーブル: サポートされています。 </li><li>v2 テーブル: StarRocks v3.0 以降でサポートされており、これらの v2 テーブルに対するクエリは位置削除をサポートします。v3.1.8、v3.2.3、v3.3 およびそれ以降のバージョンでは、v2 テーブルに対するクエリは等価削除もサポートします。 </li><li>v3 テーブル: クエリはマージオンリード（merge-on-read）の削除ベクトル（v2 の位置削除ファイルを置き換える `deletion-vector-v1` Puffin blob）をサポートします。セッション変数 `enable_iceberg_v3_deletion_vector` で無効化できます。 </li></ul> |
 
 ## 統合準備
 
@@ -779,6 +779,10 @@ Iceberg クラスターのストレージとして Google GCS を選択した場
     ```
 
 - REST カタログで Vended Credential（v4.0以降でサポート）を選択する場合、`StorageCredentialParams` を設定する必要はありません。
+
+  :::note
+  Vended Credential を使用する場合、StarRocks は REST カタログから払い出されたトークンで GCS に直接アクセスします。このとき、カタログに設定された `gcp.gcs.impersonation_service_account` は無視されます。
+  :::
 
 Google GCS 用の `StorageCredentialParams`:
 

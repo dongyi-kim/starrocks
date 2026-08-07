@@ -14,16 +14,22 @@
 
 #include "formats/iceberg/iceberg_delete_builder.h"
 
+#include <roaring/roaring64.h>
+
+#include "base/utility/defer_op.h"
 #include "cache/scan/cache_input_stream.h"
 #include "cache/scan/shared_buffered_input_stream.h"
 #include "column/vectorized_fwd.h"
 #include "common/config_scan_io_fwd.h"
+#include "formats/deletion_bitmap.h"
 #include "formats/file_input_stream.h"
 #include "formats/orc/orc_chunk_reader.h"
 #include "formats/orc/orc_input_stream.h"
 #include "formats/parquet/file_reader.h"
 #include "formats/scan_context.h"
+#include "formats/utils.h"
 #include "gen_cpp/Types_types.h"
+#include "gutil/endian.h"
 #include "runtime/chunk_helper.h"
 #include "runtime/descriptors.h"
 #include "runtime/runtime_state.h"
@@ -42,6 +48,137 @@ static const IcebergColumnMeta k_delete_file_path{
 
 static const IcebergColumnMeta k_delete_file_pos{
         .id = INT32_MAX - 102, .col_name = "pos", .type = TPrimitiveType::BIGINT};
+
+namespace {
+
+Status visit_position_delete_rows(const ChunkPtr& chunk, const IcebergPositionDeleteReader::RowCallback& cb) {
+    const ColumnPtr& file_path = chunk->get_column_by_slot_id(k_delete_file_path.id);
+    const ColumnPtr& pos = chunk->get_column_by_slot_id(k_delete_file_pos.id);
+    if (file_path == nullptr || pos == nullptr) {
+        return Status::InternalError("position-delete chunk is missing file_path/pos columns");
+    }
+    for (int i = 0; i < chunk->num_rows(); i++) {
+        cb(file_path->get(i).get_slice(), pos->get(i).get_int64());
+    }
+    return Status::OK();
+}
+
+Status read_parquet_rows(RandomAccessFile* file, int64_t length, int32_t chunk_size, const std::string& timezone,
+                         const FormatScannerOptions& options, FormatScannerStats* stats,
+                         const IcebergPositionDeleteReader::RowCallback& cb) {
+    std::unique_ptr<parquet::FileReader> reader;
+    try {
+        reader = std::make_unique<parquet::FileReader>(chunk_size, file, length);
+    } catch (std::exception& e) {
+        const auto s = strings::Substitute(
+                "IcebergPositionDeleteReader: create parquet::FileReader failed. reason = $0", e.what());
+        LOG(WARNING) << s;
+        return Status::InternalError(s);
+    }
+
+    std::vector slot_descriptors{&(IcebergDeleteFileMeta::get_delete_file_path_slot()),
+                                 &(IcebergDeleteFileMeta::get_delete_file_pos_slot())};
+
+    std::vector<FormatColumnInfo> columns;
+    for (size_t i = 0; i < slot_descriptors.size(); i++) {
+        FormatColumnInfo column;
+        column.slot_desc = slot_descriptors[i];
+        column.idx_in_chunk = i;
+        column.decode_needed = true;
+        columns.emplace_back(column);
+    }
+
+    std::vector<TIcebergSchemaField> schema_fields;
+    for (const auto* slot : slot_descriptors) {
+        TIcebergSchemaField field;
+        field.__set_field_id(slot->id());
+        field.__set_name(std::string(slot->col_name()));
+        schema_fields.push_back(field);
+    }
+    TIcebergSchema iceberg_schema;
+    iceberg_schema.__set_fields(schema_fields);
+
+    std::atomic<int32_t> lazy_column_coalesce_counter = 0;
+    // TODO: Remove this empty placeholder once FileReader supports a null predicate tree for predicate-free scans.
+    PredicateTree predicate_tree;
+    FormatScanContext format_scan_context;
+    format_scan_context.timezone = timezone;
+    format_scan_context.materialized_columns = std::move(columns);
+    format_scan_context.stats = stats;
+    format_scan_context.options = options;
+    format_scan_context.options.enable_split_tasks = false;
+    format_scan_context.lake_schema = &iceberg_schema;
+    format_scan_context.scan_range_offset = 0;
+    format_scan_context.scan_range_length = length;
+    format_scan_context.lazy_column_coalesce_counter = &lazy_column_coalesce_counter;
+    format_scan_context.predicate_tree = &predicate_tree;
+    RETURN_IF_ERROR(reader->init(&format_scan_context));
+
+    while (true) {
+        ASSIGN_OR_RETURN(ChunkPtr chunk, RuntimeChunkHelper::new_chunk_checked(slot_descriptors, chunk_size));
+        Status status = reader->get_next(&chunk);
+        if (status.is_end_of_file()) {
+            break;
+        }
+        RETURN_IF_ERROR(status);
+        RETURN_IF_ERROR(visit_position_delete_rows(chunk, cb));
+    }
+    return Status::OK();
+}
+
+Status read_orc_rows(RandomAccessFile* file, const std::string& path, int64_t length, int32_t chunk_size,
+                     const std::string& timezone, const IcebergPositionDeleteReader::RowCallback& cb) {
+    std::vector slot_descriptors{&(IcebergDeleteFileMeta::get_delete_file_path_slot()),
+                                 &(IcebergDeleteFileMeta::get_delete_file_pos_slot())};
+
+    auto input_stream = std::make_unique<ORCHdfsFileStream>(file, length, nullptr);
+    std::unique_ptr<orc::Reader> reader;
+    try {
+        orc::ReaderOptions options;
+        reader = createReader(std::move(input_stream), options);
+    } catch (std::exception& e) {
+        auto s = strings::Substitute("IcebergPositionDeleteReader: create orc::Reader failed. reason = $0", e.what());
+        LOG(WARNING) << s;
+        return Status::InternalError(s);
+    }
+
+    auto orc_reader = std::make_unique<OrcChunkReader>(chunk_size, slot_descriptors);
+    orc_reader->disable_broker_load_mode();
+    orc_reader->set_current_file_name(path);
+    RETURN_IF_ERROR(orc_reader->set_timezone(timezone));
+    RETURN_IF_ERROR(orc_reader->init(std::move(reader)));
+
+    orc::RowReader::ReadPosition position;
+    while (true) {
+        Status s = orc_reader->read_next(&position);
+        if (s.is_end_of_file()) {
+            break;
+        }
+        RETURN_IF_ERROR(s);
+        ASSIGN_OR_RETURN(ChunkPtr chunk, orc_reader->get_chunk());
+        RETURN_IF_ERROR(visit_position_delete_rows(chunk, cb));
+    }
+    return Status::OK();
+}
+
+} // namespace
+
+Status IcebergPositionDeleteReader::read_rows(RandomAccessFile* file, const std::string& path, int64_t length,
+                                              const std::string& format, int32_t chunk_size,
+                                              const std::string& timezone, const FormatScannerOptions& options,
+                                              FormatScannerStats* stats, const RowCallback& cb) {
+    FormatScannerStats local_stats;
+    if (stats == nullptr) {
+        stats = &local_stats;
+    }
+    if (format == PARQUET) {
+        return read_parquet_rows(file, length, chunk_size, timezone, options, stats, cb);
+    }
+    if (format == ORC) {
+        return read_orc_rows(file, path, length, chunk_size, timezone, cb);
+    }
+    return Status::NotSupported(strings::Substitute("unsupported iceberg position-delete file format: $0", format));
+}
 
 StatusOr<std::unique_ptr<RandomAccessFile>> IcebergDeleteBuilder::open_random_access_file(
         const TIcebergDeleteFile& delete_file, FormatScannerStats& fs_stats, FormatScannerStats& app_stats,
@@ -67,101 +204,101 @@ StatusOr<std::unique_ptr<RandomAccessFile>> IcebergDeleteBuilder::open_random_ac
     return file;
 }
 
-Status IcebergDeleteBuilder::fill_skip_rowids(const ChunkPtr& chunk) const {
-    const ColumnPtr& file_path = chunk->get_column_by_slot_id(k_delete_file_path.id);
-    const ColumnPtr& pos = chunk->get_column_by_slot_id(k_delete_file_pos.id);
-    for (int i = 0; i < chunk->num_rows(); i++) {
-        if (file_path->get(i).get_slice() == _ctx.data_file_path) {
-            _deletion_bitmap->add_value(pos->get(i).get_int64());
-        }
+StatusOr<std::unique_ptr<RandomAccessFile>> IcebergDeleteBuilder::open_deletion_vector_file(
+        const TIcebergDeleteFile& delete_file, int64_t offset, int64_t size, FormatScannerStats& fs_stats,
+        FormatScannerStats& app_stats, std::shared_ptr<SharedBufferedInputStream>& shared_buffered_input_stream,
+        std::shared_ptr<CacheInputStream>& cache_input_stream) const {
+    const FileInputStreamOptions options{.fs = _ctx.fs,
+                                         .file_path = delete_file.full_path,
+                                         .file_size = delete_file.length,
+                                         .fs_stats = &fs_stats,
+                                         .app_stats = &app_stats,
+                                         .datacache_options = _ctx.datacache_options};
+    ASSIGN_OR_RETURN(auto file, create_random_access_file(shared_buffered_input_stream, cache_input_stream, options));
+    std::vector<SharedBufferedInputStream::IORange> io_ranges{};
+    int64_t cur = offset;
+    const int64_t end = offset + size;
+    while (cur < end) {
+        const int64_t remain_length =
+                std::min(static_cast<int64_t>(config::io_coalesce_read_max_buffer_size), end - cur);
+        io_ranges.emplace_back(cur, remain_length);
+        cur += remain_length;
     }
+    RETURN_IF_ERROR(shared_buffered_input_stream->set_io_ranges(io_ranges));
+    return file;
+}
+
+// deletion-vector-v1 blob: [4B BE length][4B magic][roaring64 bitmap][4B BE CRC-32C].
+static constexpr int64_t kDvLengthSize = 4;
+static constexpr int64_t kDvMagicSize = 4;
+static constexpr int64_t kDvCrcSize = 4;
+static constexpr uint32_t kDvMagic = 1681511377; // bytes {0xD1, 0xD3, 0x39, 0x64}
+
+Status IcebergDeleteBuilder::parse_deletion_vector_blob(const uint8_t* blob, int64_t content_size,
+                                                        DeletionBitmap* bitmap) {
+    if (content_size < kDvLengthSize + kDvMagicSize + kDvCrcSize) {
+        return Status::InternalError(
+                strings::Substitute("Iceberg deletion vector blob too small: content_size_in_bytes=$0", content_size));
+    }
+
+    uint32_t blob_length;
+    memcpy(&blob_length, blob, kDvLengthSize);
+    if (LittleEndian::IsLittleEndian()) {
+        blob_length = BigEndian::ToHost32(blob_length);
+    }
+    const int64_t expected_length = content_size - kDvLengthSize - kDvCrcSize;
+    if (static_cast<int64_t>(blob_length) != expected_length) {
+        return Status::InternalError(strings::Substitute(
+                "Iceberg deletion vector length mismatch: prefix=$0, expected=$1", blob_length, expected_length));
+    }
+
+    uint32_t magic_number;
+    memcpy(&magic_number, blob + kDvLengthSize, kDvMagicSize);
+    if (!LittleEndian::IsLittleEndian()) {
+        magic_number = LittleEndian::ToHost32(magic_number);
+    }
+    if (magic_number != kDvMagic) {
+        return Status::InternalError(
+                strings::Substitute("Iceberg deletion vector unexpected magic number: $0", magic_number));
+    }
+
+    const char* bitmap_ptr = reinterpret_cast<const char*>(blob) + kDvLengthSize + kDvMagicSize;
+    const int64_t bitmap_length = content_size - kDvLengthSize - kDvMagicSize - kDvCrcSize;
+    roaring64_bitmap_t* deserialized = roaring64_bitmap_portable_deserialize_safe(bitmap_ptr, bitmap_length);
+    if (deserialized == nullptr) {
+        return Status::InternalError("Failed to deserialize Iceberg deletion vector roaring64 bitmap");
+    }
+    DeferOp free_bitmap([&deserialized] { roaring64_bitmap_free(deserialized); });
+
+    bitmap->merge(deserialized);
     return Status::OK();
 }
 
-Status IcebergDeleteBuilder::build_parquet(const TIcebergDeleteFile& delete_file) const {
+Status IcebergDeleteBuilder::build_deletion_vector(const TIcebergDeleteFile& delete_file) const {
+    if (!delete_file.__isset.content_offset || !delete_file.__isset.content_size_in_bytes) {
+        return Status::InternalError("Iceberg deletion vector missing content_offset/content_size_in_bytes");
+    }
+    const int64_t content_offset = delete_file.content_offset;
+    const int64_t content_size = delete_file.content_size_in_bytes;
+
     FormatScannerStats app_stats;
     FormatScannerStats fs_stats;
-    std::shared_ptr<SharedBufferedInputStream> shared_buffered_input_stream = nullptr;
-    std::shared_ptr<CacheInputStream> cache_input_stream = nullptr;
+    std::shared_ptr<SharedBufferedInputStream> shared_buffered_input_stream;
+    std::shared_ptr<CacheInputStream> cache_input_stream;
+    ASSIGN_OR_RETURN(auto file, open_deletion_vector_file(delete_file, content_offset, content_size, fs_stats,
+                                                          app_stats, shared_buffered_input_stream, cache_input_stream));
 
-    ASSIGN_OR_RETURN(auto file, open_random_access_file(delete_file, fs_stats, app_stats, shared_buffered_input_stream,
-                                                        cache_input_stream));
+    std::vector<uint8_t> blob(content_size);
+    RETURN_IF_ERROR(file->read_at_fully(content_offset, blob.data(), content_size));
 
-    std::unique_ptr<parquet::FileReader> reader;
-    try {
-        reader = std::make_unique<parquet::FileReader>(_ctx.chunk_size, file.get(), file->get_size().value());
-    } catch (std::exception& e) {
-        const auto s = strings::Substitute(
-                "IcebergDeleteBuilder::build_parquet create parquet::FileReader failed. reason = $0", e.what());
-        LOG(WARNING) << s;
-        return Status::InternalError(s);
-    }
+    RETURN_IF_ERROR(parse_deletion_vector_blob(blob.data(), content_size, _deletion_bitmap.get()));
 
-    std::vector<FormatColumnInfo> columns;
-    std::vector slot_descriptors{&(IcebergDeleteFileMeta::get_delete_file_path_slot()),
-                                 &(IcebergDeleteFileMeta::get_delete_file_pos_slot())};
-    for (size_t i = 0; i < slot_descriptors.size(); i++) {
-        auto* slot = slot_descriptors[i];
-        FormatColumnInfo column;
-        column.slot_desc = slot;
-        column.idx_in_chunk = i;
-        column.decode_needed = true;
-        columns.emplace_back(column);
-    }
-
-    std::vector<TIcebergSchemaField> schema_fields;
-
-    // build file path field
-    TIcebergSchemaField file_path_field;
-    file_path_field.__set_field_id(k_delete_file_path.id);
-    file_path_field.__set_name(k_delete_file_path.col_name);
-    schema_fields.push_back(file_path_field);
-
-    // build position field
-    TIcebergSchemaField pos_field;
-    pos_field.__set_field_id(k_delete_file_pos.id);
-    pos_field.__set_name(k_delete_file_pos.col_name);
-    schema_fields.push_back(pos_field);
-
-    TIcebergSchema iceberg_schema = TIcebergSchema();
-    iceberg_schema.__set_fields(schema_fields);
-
-    std::atomic<int32_t> lazy_column_coalesce_counter = 0;
-    // TODO: Remove this empty placeholder once FileReader supports a null predicate tree for predicate-free scans.
-    PredicateTree predicate_tree;
-    FormatScanContext format_scan_context;
-    format_scan_context.timezone = _ctx.scan_context->timezone;
-    format_scan_context.materialized_columns = std::move(columns);
-    format_scan_context.stats = &app_stats;
-    format_scan_context.options = _ctx.scan_context->options;
-    format_scan_context.options.enable_split_tasks = false;
-    format_scan_context.lake_schema = &iceberg_schema;
-    format_scan_context.scan_range_offset = 0;
-    format_scan_context.scan_range_length = delete_file.length;
-    format_scan_context.lazy_column_coalesce_counter = &lazy_column_coalesce_counter;
-    format_scan_context.predicate_tree = &predicate_tree;
-    RETURN_IF_ERROR(reader->init(&format_scan_context));
-
-    while (true) {
-        ASSIGN_OR_RETURN(ChunkPtr chunk, RuntimeChunkHelper::new_chunk_checked(slot_descriptors, _ctx.chunk_size));
-
-        Status status = reader->get_next(&chunk);
-        if (status.is_end_of_file()) {
-            break;
-        }
-
-        RETURN_IF_ERROR(status);
-        RETURN_IF_ERROR(fill_skip_rowids(chunk));
-    }
     update_delete_file_io_counter(_ctx.runtime_profile, app_stats, fs_stats, cache_input_stream,
                                   shared_buffered_input_stream);
     return Status::OK();
 }
 
-Status IcebergDeleteBuilder::build_orc(const TIcebergDeleteFile& delete_file) const {
-    std::vector slot_descriptors{&(IcebergDeleteFileMeta::get_delete_file_path_slot()),
-                                 &(IcebergDeleteFileMeta::get_delete_file_pos_slot())};
-
+Status IcebergDeleteBuilder::build(const TIcebergDeleteFile& delete_file, const std::string& format) const {
     FormatScannerStats app_stats;
     FormatScannerStats fs_stats;
     std::shared_ptr<SharedBufferedInputStream> shared_buffered_input_stream;
@@ -170,44 +307,24 @@ Status IcebergDeleteBuilder::build_orc(const TIcebergDeleteFile& delete_file) co
     ASSIGN_OR_RETURN(auto file, open_random_access_file(delete_file, fs_stats, app_stats, shared_buffered_input_stream,
                                                         cache_input_stream));
 
-    auto input_stream = std::make_unique<ORCHdfsFileStream>(file.get(), delete_file.length, nullptr);
-    std::unique_ptr<orc::Reader> reader;
-    try {
-        orc::ReaderOptions options;
-        reader = createReader(std::move(input_stream), options);
-    } catch (std::exception& e) {
-        auto s =
-                strings::Substitute("ORCPositionDeleteBuilder::build create orc::Reader failed. reason = $0", e.what());
-        LOG(WARNING) << s;
-        return Status::InternalError(s);
-    }
-
-    auto orc_reader = std::make_unique<OrcChunkReader>(_ctx.chunk_size, slot_descriptors);
-    orc_reader->disable_broker_load_mode();
-    orc_reader->set_current_file_name(delete_file.full_path);
-    RETURN_IF_ERROR(orc_reader->set_timezone(_ctx.scan_context->timezone));
-    RETURN_IF_ERROR(orc_reader->init(std::move(reader)));
-
-    orc::RowReader::ReadPosition position;
-    Status s;
-
-    while (true) {
-        s = orc_reader->read_next(&position);
-        if (s.is_end_of_file()) {
-            break;
-        }
-
-        RETURN_IF_ERROR(s);
-
-        auto ret = orc_reader->get_chunk();
-        if (!ret.ok()) {
-            return ret.status();
-        }
-        RETURN_IF_ERROR(fill_skip_rowids(ret.value()));
-    }
+    RETURN_IF_ERROR(IcebergPositionDeleteReader::read_rows(
+            file.get(), delete_file.full_path, delete_file.length, format, _ctx.chunk_size, _ctx.scan_context->timezone,
+            _ctx.scan_context->options, &app_stats, [this](const Slice& file_path, int64_t pos) {
+                if (file_path == _ctx.data_file_path) {
+                    _deletion_bitmap->add_value(pos);
+                }
+            }));
     update_delete_file_io_counter(_ctx.runtime_profile, app_stats, fs_stats, cache_input_stream,
                                   shared_buffered_input_stream);
     return Status::OK();
+}
+
+Status IcebergDeleteBuilder::build_parquet(const TIcebergDeleteFile& delete_file) const {
+    return build(delete_file, PARQUET);
+}
+
+Status IcebergDeleteBuilder::build_orc(const TIcebergDeleteFile& delete_file) const {
+    return build(delete_file, ORC);
 }
 
 SlotDescriptor IcebergDeleteFileMeta::gen_slot_helper(const IcebergColumnMeta& meta) {

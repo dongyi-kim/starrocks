@@ -40,8 +40,8 @@ Take note of the following points when you use StarRocks to query data from Iceb
 
 | **File format** | **Compression format**                                   | **Iceberg table version**                                           |
 | --------------- | ---------------------------------------------- | ------------------------------------------------------------ |
-| Parquet         | SNAPPY, LZ4, ZSTD, GZIP, and NO_COMPRESSION      | <ul><li>v1 tables: supported. </li><li>v2 tables: supported from StarRocks v3.1 onwards in which queries on these v2 tables support position deletes. In v3.1.10, v3.2.5, v3.3 and their later versions, queries on v2 tables also support equality deletes. </li></ul> |
-| ORC             | ZLIB, SNAPPY, LZO, LZ4, ZSTD, and NO_COMPRESSION | <ul><li>v1 tables: supported. </li><li>v2 tables: supported from StarRocks v3.0 onwards in which queries on these v2 tables support position deletes. In v3.1.8, v3.2.3, v3.3 and their later versions, queries on v2 tables also support equality deletes. </li></ul> |
+| Parquet         | SNAPPY, LZ4, ZSTD, GZIP, and NO_COMPRESSION      | <ul><li>v1 tables: supported. </li><li>v2 tables: supported from StarRocks v3.1 onwards in which queries on these v2 tables support position deletes. In v3.1.10, v3.2.5, v3.3 and their later versions, queries on v2 tables also support equality deletes. </li><li>v3 tables: queries support merge-on-read deletion vectors (the `deletion-vector-v1` Puffin blob that replaces v2 position-delete files). This can be turned off with the session variable `enable_iceberg_v3_deletion_vector`. </li></ul> |
+| ORC             | ZLIB, SNAPPY, LZO, LZ4, ZSTD, and NO_COMPRESSION | <ul><li>v1 tables: supported. </li><li>v2 tables: supported from StarRocks v3.0 onwards in which queries on these v2 tables support position deletes. In v3.1.8, v3.2.3, v3.3 and their later versions, queries on v2 tables also support equality deletes. </li><li>v3 tables: queries support merge-on-read deletion vectors (the `deletion-vector-v1` Puffin blob that replaces v2 position-delete files). This can be turned off with the session variable `enable_iceberg_v3_deletion_vector`. </li></ul> |
 
 ## Integration preparation
 
@@ -780,6 +780,10 @@ If you choose Google GCS as storage for your Iceberg cluster, take one of the fo
     ```
 
 - To choose REST catalog with vended credential (supported from v4.0 onwards), you do not need to configure `StorageCredentialParams`.
+
+  :::note
+  When vended credentials are used, StarRocks accesses GCS directly with the token vended by the REST catalog. Any `gcp.gcs.impersonation_service_account` configured on the catalog is ignored for that access.
+  :::
 
 `StorageCredentialParams` for Google GCS:
 

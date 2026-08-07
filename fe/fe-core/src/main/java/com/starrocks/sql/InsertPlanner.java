@@ -123,9 +123,11 @@ import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -281,7 +283,14 @@ public class InsertPlanner {
             inferOutputSchemaForPartialUpdate(insertStmt);
         } else {
             outputBaseSchema = targetTable.getBaseSchema();
-            outputFullSchema = targetTable.getFullSchema();
+            // Online OPTIMIZE rewrites a temporary partition and does not perform a schema change.
+            // Exclude stale schema-change shadow columns from the sink while retaining derived columns
+            // of normal synchronous materialized views, which are also kept in fullSchema. A completed
+            // OPTIMIZE may also leave same-named generated-column entries in fullSchema, so only emit one
+            // occurrence of each logical column and prefer the committed base-schema definition.
+            outputFullSchema = session.isOptimizeRewrite()
+                    ? getOptimizeOutputFullSchema(targetTable)
+                    : targetTable.getFullSchema();
         }
 
         if (targetTable.isIcebergTable()) {
@@ -361,12 +370,32 @@ public class InsertPlanner {
 
             List<Pair<Integer, ColumnDict>> globalDicts = Lists.newArrayList();
             long tableId = targetTable.getId();
+            // A shadow-rewrite INSERT (the internal online rewrite that materializes a range rollup or a
+            // schema-change shadow index) writes ONLY the target write index. Base columns outside that
+            // index's column set are carried in the tuple solely to satisfy the sink's base
+            // distribution/partition plumbing (BE validates their presence); they are never persisted nor
+            // used for range routing (per-index distribution exprs route by the target index's key). Relax
+            // their slot nullability so an omitted NOT-NULL base column that is default-filled with NULL is
+            // not rejected by the BE non-nullable data validation.
+            boolean shadowRewriteSubsetWrite =
+                    insertStmt.isShadowRewrite() && insertStmt.getTargetWriteIndexId() != null;
+            Set<String> shadowRewriteTargetIndexColumns = Collections.emptySet();
+            if (shadowRewriteSubsetWrite) {
+                MaterializedIndexMeta targetIndexMeta =
+                        ((OlapTable) targetTable).getIndexMetaByMetaId(insertStmt.getTargetWriteIndexId());
+                Preconditions.checkState(targetIndexMeta != null && !targetIndexMeta.getSchema().isEmpty(),
+                        "shadow-rewrite target write index %s not found", insertStmt.getTargetWriteIndexId());
+                shadowRewriteTargetIndexColumns = targetIndexMeta.getSchema().stream()
+                        .map(c -> c.getName().toLowerCase(Locale.ROOT)).collect(Collectors.toSet());
+            }
             for (Column column : outputFullSchema) {
                 SlotDescriptor slotDescriptor = descriptorTable.addSlotDescriptor(tupleDesc);
                 slotDescriptor.setIsMaterialized(true);
                 slotDescriptor.setType(column.getType());
                 slotDescriptor.setColumn(column);
-                slotDescriptor.setIsNullable(column.isAllowNull());
+                boolean nullable = column.isAllowNull() || (shadowRewriteSubsetWrite
+                        && !shadowRewriteTargetIndexColumns.contains(column.getName().toLowerCase(Locale.ROOT)));
+                slotDescriptor.setIsNullable(nullable);
                 if (column.getType().isVarchar() &&
                         IDictManager.getInstance().hasGlobalDict(tableId, column.getColumnId())) {
                     Optional<ColumnDict> dict = IDictManager.getInstance().getGlobalDict(tableId, column.getColumnId());
@@ -566,6 +595,18 @@ public class InsertPlanner {
         }
         throw new StarRocksPlannerException(String.format("failed to generate plan for the statement after %dms",
                 watch.elapsed(TimeUnit.MILLISECONDS)), ErrorType.INTERNAL_ERROR);
+    }
+
+    private List<Column> getOptimizeOutputFullSchema(Table targetTable) {
+        List<Column> outputSchema = new ArrayList<>(targetTable.getBaseSchema());
+        Set<String> outputColumnNames = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
+        targetTable.getBaseSchema().stream().map(Column::getName).forEach(outputColumnNames::add);
+        for (Column column : targetTable.getFullSchema()) {
+            if (!column.isShadowColumn() && outputColumnNames.add(column.getName())) {
+                outputSchema.add(column);
+            }
+        }
+        return outputSchema;
     }
 
     private ExecPlan buildExecPlan(InsertStmt insertStmt, ConnectContext session, List<ColumnRefOperator> outputColumns,
@@ -847,15 +888,30 @@ public class InsertPlanner {
                 String originName = Column.removeNamePrefix(targetColumn.getName());
                 Optional<Column> optOriginColumn = outputFullSchema.stream()
                         .filter(c -> c.nameEquals(originName, false)).findFirst();
-                Preconditions.checkState(optOriginColumn.isPresent());
-                Column originColumn = optOriginColumn.get();
-                ColumnRefOperator originColRefOp = outputColumns.get(outputFullSchema.indexOf(originColumn));
+                if (optOriginColumn.isPresent()) {
+                    Column originColumn = optOriginColumn.get();
+                    ColumnRefOperator originColRefOp = outputColumns.get(outputFullSchema.indexOf(originColumn));
 
-                ColumnRefOperator columnRefOperator = columnRefFactory.create(
-                        targetColumn.getName(), targetColumn.getType(), targetColumn.isAllowNull());
+                    ColumnRefOperator columnRefOperator = columnRefFactory.create(
+                            targetColumn.getName(), targetColumn.getType(), targetColumn.isAllowNull());
 
-                outputColumns.add(columnRefOperator);
-                columnRefMap.put(columnRefOperator, new CastOperator(targetColumn.getType(), originColRefOp, true));
+                    outputColumns.add(columnRefOperator);
+                    columnRefMap.put(columnRefOperator, new CastOperator(targetColumn.getType(), originColRefOp, true));
+                } else {
+                    // No same-named origin in the output schema. This is legitimate ONLY for a genuinely
+                    // new added column (e.g. a range ADD-key column); a MODIFY-COLUMN shadow always retains
+                    // its origin and takes the branch above. Preserve the invariant the original code
+                    // asserted (optOriginColumn.isPresent()) by materializing a default only when no
+                    // committed base column has this name -- otherwise a MODIFY shadow that lost its origin
+                    // would silently emit a wrong DEFAULT instead of failing fast.
+                    boolean genuinelyNewColumn =
+                            outputBaseSchema.stream().noneMatch(c -> c.nameEquals(originName, false));
+                    Preconditions.checkState(genuinelyNewColumn,
+                            "shadow column %s has no same-named origin but exists in the base schema",
+                            targetColumn.getName());
+                    // Materialize its CONST/NULL default instead of the origin-cast above.
+                    materializeShadowColumnDefault(columnRefFactory, outputColumns, columnRefMap, targetColumn);
+                }
                 continue;
             }
 
@@ -915,25 +971,46 @@ public class InsertPlanner {
 
             // columnIdx >= outputColumns.size() mean this is a new add schema change column
             if (columnIdx >= outputColumns.size()) {
-                ScalarOperator scalarOperator = null;
-                Column.DefaultValueType defaultValueType = targetColumn.getDefaultValueType();
-                if (defaultValueType == Column.DefaultValueType.NULL) {
-                    scalarOperator = ConstantOperator.createNull(targetColumn.getType());
-                } else if (defaultValueType == Column.DefaultValueType.CONST) {
-                    scalarOperator = ConstantOperator.createVarchar(targetColumn.calculatedDefaultValue());
-                } else if (defaultValueType == Column.DefaultValueType.VARY) {
-                    throw new SemanticException("Column:" + targetColumn.getName() + " has unsupported default value:"
-                            + targetColumn.getDefaultExpr().getExpr());
-                }
-                ColumnRefOperator col = columnRefFactory
-                        .create(scalarOperator, scalarOperator.getType(), scalarOperator.isNullable());
-                outputColumns.add(col);
-                columnRefMap.put(col, scalarOperator);
+                materializeShadowColumnDefault(columnRefFactory, outputColumns, columnRefMap, targetColumn);
             } else {
                 columnRefMap.put(outputColumns.get(columnIdx), outputColumns.get(columnIdx));
             }
         }
         return root.withNewRoot(new LogicalProjectOperator(new HashMap<>(columnRefMap)));
+    }
+
+    /**
+     * Materialize {@code targetColumn}'s CONST/NULL default as a fresh {@link ColumnRefOperator}, appended to
+     * {@code outputColumns} and mapped in {@code columnRefMap}. Used by {@link #fillShadowColumns} both for a
+     * plain new-add schema-change column and for a {@code __starrocks_shadow_}-prefixed column with no
+     * same-named origin (a genuinely new added column, e.g. a range ADD-key column).
+     */
+    private void materializeShadowColumnDefault(ColumnRefFactory columnRefFactory, List<ColumnRefOperator> outputColumns,
+                                                Map<ColumnRefOperator, ScalarOperator> columnRefMap, Column targetColumn) {
+        ScalarOperator scalarOperator;
+        Column.DefaultValueType defaultValueType = targetColumn.getDefaultValueType();
+        if (defaultValueType == Column.DefaultValueType.NULL) {
+            scalarOperator = ConstantOperator.createNull(targetColumn.getType());
+        } else if (defaultValueType == Column.DefaultValueType.CONST) {
+            // calculatedDefaultValue() evaluates a time-function default (e.g. CURRENT_TIMESTAMP) to the
+            // transaction time and returns a scalar literal's string, but it returns null for a complex
+            // expr-object default (ARRAY/MAP/STRUCT literal); getDefaultValue() renders that via toSql().
+            // Take whichever is non-null so a bundled non-key value column with a complex constant default
+            // is materialized as a VARCHAR constant (cast to the column type downstream) rather than NPEing.
+            String defaultValueStr = targetColumn.calculatedDefaultValue();
+            if (defaultValueStr == null) {
+                defaultValueStr = targetColumn.getDefaultValue();
+            }
+            scalarOperator = ConstantOperator.createVarchar(defaultValueStr);
+        } else {
+            // VARY (variable expr, e.g. uuid()) -- not materializable as a constant for the shadow rewrite.
+            throw new SemanticException("Column:" + targetColumn.getName() + " has unsupported default value:"
+                    + targetColumn.getDefaultExpr().getExpr());
+        }
+        ColumnRefOperator col = columnRefFactory
+                .create(scalarOperator, scalarOperator.getType(), scalarOperator.isNullable());
+        outputColumns.add(col);
+        columnRefMap.put(col, scalarOperator);
     }
 
     private OptExprBuilder castOutputColumnsTypeToTargetColumns(ColumnRefFactory columnRefFactory,

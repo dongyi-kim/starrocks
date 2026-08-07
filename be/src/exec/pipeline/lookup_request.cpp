@@ -30,11 +30,10 @@
 #include "column/vectorized_fwd.h"
 #include "common/object_pool.h"
 #include "common/runtime_profile.h"
+#include "connector/hive/hive_connector.h"
 #include "connector/hive/iceberg_global_late_materialization_context.h"
-#include "connector/hive_connector.h"
 #include "exec/pipeline/lookup_operator.h"
 #include "exec/pipeline/query_context.h"
-#include "exec/pipeline/scan/glm_manager.h"
 #include "exprs/expr_executor.h"
 #include "exprs/expr_factory.h"
 #include "runtime/chunk_accumulator.h"
@@ -748,7 +747,7 @@ auto NativeLookUpTask::_build_row_id_range(RuntimeState* state, const Columns& r
     std::vector<RowLocatorTuple> locators;
 
     if (num_rows == 0) {
-        return Status::OK();
+        return locators;
     }
 
     int64_t cur_tablet = tablet_ids[0];

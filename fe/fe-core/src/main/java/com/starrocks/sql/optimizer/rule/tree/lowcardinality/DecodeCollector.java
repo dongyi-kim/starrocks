@@ -34,6 +34,7 @@ import com.starrocks.common.util.UnionFind;
 import com.starrocks.connector.hive.HiveStorageFormat;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.AggregateType;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
@@ -58,6 +59,7 @@ import com.starrocks.sql.optimizer.operator.physical.PhysicalTableFunctionOperat
 import com.starrocks.sql.optimizer.operator.physical.PhysicalTopNOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalUnionOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalWindowOperator;
+import com.starrocks.sql.optimizer.operator.scalar.ArrayOperator;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CaseWhenOperator;
@@ -97,6 +99,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static org.apache.iceberg.TableProperties.DEFAULT_FILE_FORMAT;
 import static org.apache.iceberg.TableProperties.DEFAULT_FILE_FORMAT_DEFAULT;
@@ -144,12 +147,16 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
     // array<string> support:
     //  array<string> -> array<string>: array function
     //  array<string> -> string       : array element
+    // Only processed if the first argument (input array) is not constant. Any string or array<string> constant
+    // parameters will be encoded into the array's dictionary domain using dict_encode().
     public static final Set<String> LOW_CARD_ARRAY_FUNCTIONS = ImmutableSet.of(
             FunctionSet.ARRAY_MIN,  // ARRAY -> STRING
             FunctionSet.ARRAY_MAX, FunctionSet.ARRAY_DISTINCT, // ARRAY -> ARRAY
             FunctionSet.ARRAY_SORT, FunctionSet.REVERSE, FunctionSet.ARRAY_SLICE, FunctionSet.ARRAY_FILTER,
             FunctionSet.ARRAY_LENGTH, // ARRAY -> bigint, return direct
-            FunctionSet.CARDINALITY);
+            FunctionSet.CARDINALITY, FunctionSet.ARRAY_CONTAINS, FunctionSet.ARRAY_CONTAINS_ALL,
+            FunctionSet.ARRAY_CONTAINS_SEQ, FunctionSet.ARRAY_INTERSECT, FunctionSet.ARRAY_POSITION,
+            FunctionSet.ARRAY_REMOVE);
 
     private final SessionVariable sessionVariable;
     private final boolean isQuery;
@@ -195,12 +202,39 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
     // check if there is a blocking node in plan
     private boolean canBlockingOutput = false;
 
+    // Populated only in query-dump capture mode: the per-column global dicts accepted at OLAP scan level. The
+    // rule commits these to the dump after the rewrite is confirmed to apply, so the captured dict is exactly
+    // the one the plan uses (see LowCardinalityRewriteRule).
+    private final boolean captureGlobalDictForDump;
+    private final List<CapturedGlobalDict> capturedGlobalDicts = Lists.newArrayList();
+
+    public static class CapturedGlobalDict {
+        public final OlapTable table;
+        public final String columnName;
+        public final ColumnDict dict;
+
+        public CapturedGlobalDict(OlapTable table, String columnName, ColumnDict dict) {
+            this.table = table;
+            this.columnName = columnName;
+            this.dict = dict;
+        }
+    }
+
     public DecodeCollector(SessionVariable session, boolean isQuery) {
+        this(session, isQuery, false);
+    }
+
+    public DecodeCollector(SessionVariable session, boolean isQuery, boolean captureGlobalDictForDump) {
         this.sessionVariable = session;
         this.isQuery = isQuery;
+        this.captureGlobalDictForDump = captureGlobalDictForDump;
         unionDictionaryManager = new UnionDictionaryManager(
                 sessionVariable, stringRefToDefineExprMap, globalDicts, joinEqColumnGroupIds);
         structManager = new StructManager(sessionVariable.isEnableStructLowCardinalityOptimize());
+    }
+
+    public List<CapturedGlobalDict> getCapturedGlobalDicts() {
+        return capturedGlobalDicts;
     }
 
     public void collect(OptExpression root, DecodeContext context) {
@@ -1122,6 +1156,14 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
                 continue;
             }
 
+            // Condition 1.2: an aggregate-state column stores a serialized aggregate state, not the
+            // values its type describes. The BE reads it through the agg state descriptor rather than
+            // through the column type, so it would decode dictionary codes as if they were still the
+            // original values.
+            if (isAggStateColumn(scan, column)) {
+                continue;
+            }
+
             // If it's not an extended column, we have to check the cardinality of the column.
             // TODO(murphy) support collect cardinality of extended column
             if (!checkExtendedColumn(scan, column)) {
@@ -1155,6 +1197,9 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
             }
 
             markedAsGlobalDictOpt(info, column, dict.get());
+            if (captureGlobalDictForDump) {
+                capturedGlobalDicts.add(new CapturedGlobalDict(table, column.getName(), dict.get()));
+            }
         }
 
         if (info.outputStringColumns.isEmpty()) {
@@ -1162,6 +1207,11 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
         }
 
         return info;
+    }
+
+    private boolean isAggStateColumn(PhysicalOlapScanOperator scan, ColumnRefOperator column) {
+        Column columnMeta = scan.getColRefToColumnMetaMap().get(column);
+        return columnMeta != null && columnMeta.getAggregationType() == AggregateType.AGG_STATE_UNION;
     }
 
     private boolean banArrayColumnWithPredicate(PhysicalScanOperator scan, ColumnRefOperator column) {
@@ -1534,6 +1584,12 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
             return CONSTANTS;
         }
 
+        private static boolean isSupportedArrayFnConstantParameter(ScalarOperator op) {
+            return op.isConstantRef() || (!op.getType().isStringType() && !op.getType().isStringArrayType()) ||
+                    (op instanceof ArrayOperator arrayOp &&
+                            arrayOp.getChildren().stream().allMatch(ScalarOperator::isConstantRef));
+        }
+
         @Override
         public ScalarOperator visitCall(CallOperator call, Void context) {
             if (FunctionSet.nonDeterministicFunctions.contains(call.getFnName())) {
@@ -1552,10 +1608,13 @@ public class DecodeCollector extends OptExpressionVisitor<DecodeInfo, DecodeInfo
                 ScalarOperator result = mergeWithArray(visitChildren(call, context), call);
                 return !result.isConstant() ? call : result;
             }
-
             if (LOW_CARD_ARRAY_FUNCTIONS.contains(call.getFnName()) ||
                     LOW_CARD_AGGREGATE_FUNCTIONS.contains(call.getFnName())) {
-                return mergeWithArray(visitChildren(call, context), call);
+                List<ScalarOperator> newChildren = visitChildren(call, context);
+                boolean forbidden = newChildren.get(0).isConstant() ||
+                        IntStream.range(0, newChildren.size()).anyMatch(i -> newChildren.get(i).equals(CONSTANTS)
+                                && !isSupportedArrayFnConstantParameter(call.getChild(i)));
+                return forbidden ? forbidden(newChildren, call) : mergeWithArray(newChildren, call);
             }
             if (LOW_CARD_STRING_FUNCTIONS.contains(call.getFnName())) {
                 return merge(visitChildren(call, context), call);

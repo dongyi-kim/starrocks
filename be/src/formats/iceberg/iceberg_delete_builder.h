@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -45,6 +46,21 @@ struct IcebergDeleteBuilderContext {
 
 struct IcebergColumnMeta;
 
+// Reads an Iceberg position-delete file (the 2-column file_path/pos layout, parquet or orc) row
+// by row. Opening the file is the caller's concern: the scan side reads through its IO stack
+// (data cache, coalesced IO), other callers may use a plain FileSystem open.
+class IcebergPositionDeleteReader {
+public:
+    using RowCallback = std::function<void(const Slice& file_path, int64_t pos)>;
+
+    // Invokes cb once per row. `path` is used for error reporting only; `length` is the file
+    // size in bytes. `stats` may be null when the caller does not collect scanner stats.
+    static Status read_rows(RandomAccessFile* file, const std::string& path, int64_t length,
+                            const std::string& format, // "parquet" | "orc"
+                            int32_t chunk_size, const std::string& timezone, const FormatScannerOptions& options,
+                            FormatScannerStats* stats, const RowCallback& cb);
+};
+
 class IcebergDeleteBuilder {
 public:
     explicit IcebergDeleteBuilder(IcebergDeleteBuilderContext ctx)
@@ -56,19 +72,30 @@ public:
 
     Status build_parquet(const TIcebergDeleteFile& delete_file) const;
 
+    Status build_deletion_vector(const TIcebergDeleteFile& delete_file) const;
+
+    // Exposed for testing.
+    static Status parse_deletion_vector_blob(const uint8_t* blob, int64_t content_size, DeletionBitmap* bitmap);
+
     DeletionBitmapPtr deletion_bitmap() const { return _deletion_bitmap; }
 
 private:
+    Status build(const TIcebergDeleteFile& delete_file, const std::string& format) const;
+
     StatusOr<std::unique_ptr<RandomAccessFile>> open_random_access_file(
             const TIcebergDeleteFile& delete_file, FormatScannerStats& fs_stats, FormatScannerStats& app_stats,
             std::shared_ptr<SharedBufferedInputStream>& shared_buffered_input_stream,
+            std::shared_ptr<CacheInputStream>& cache_input_stream) const;
+
+    StatusOr<std::unique_ptr<RandomAccessFile>> open_deletion_vector_file(
+            const TIcebergDeleteFile& delete_file, int64_t offset, int64_t size, FormatScannerStats& fs_stats,
+            FormatScannerStats& app_stats, std::shared_ptr<SharedBufferedInputStream>& shared_buffered_input_stream,
             std::shared_ptr<CacheInputStream>& cache_input_stream) const;
 
     static void update_delete_file_io_counter(
             RuntimeProfile* parent_profile, const FormatScannerStats& app_stats, const FormatScannerStats& fs_stats,
             const std::shared_ptr<CacheInputStream>& cache_input_stream,
             const std::shared_ptr<SharedBufferedInputStream>& shared_buffered_input_stream);
-    Status fill_skip_rowids(const ChunkPtr& chunk) const;
 
     IcebergDeleteBuilderContext _ctx;
     DeletionBitmapPtr _deletion_bitmap;

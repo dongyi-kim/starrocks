@@ -190,6 +190,13 @@ The variables are described **in alphabetical order**. Variables with the `globa
 
 If you want to activate the roles assigned to you in a session, use the [SET ROLE](sql-statements/account-management/SET_DEFAULT_ROLE.md) command.
 
+### ann_params
+
+* **Description**: Specifies query-time parameters for approximate nearest neighbor (ANN) vector index searches. The value is a JSON object string whose keys and values are strings. HNSW supports `efsearch`; IVFPQ supports `nprobe`, `max_codes`, `scan_table_threshold`, `polysemous_ht`, and `range_search_confidence`. You can set the variable for a session or a single statement, for example `SET ann_params = '{"efsearch":"256"}'` or `SET_VAR (ann_params='{"efsearch":"256"}')`.
+* **Default**: `""`
+* **Data type**: String
+* **Scope**: Session
+
 ### array_low_cardinality_optimize
 
 * **Scope**: Session
@@ -730,6 +737,27 @@ Default value: `true`, which means global RF is enabled. If this feature is disa
 * **Description**: Whether to enable strict mode while loading data using INSERT from files(). Valid values: `true` and `false` (Default). When strict mode is enabled, the system loads only qualified rows. It filters out unqualified rows and returns details about the unqualified rows. For more information, see [Strict mode](../loading/load_concept/strict_mode.md). In versions earlier than v3.4.0, when `enable_insert_strict` is set to `true`, the INSERT jobs fails when there is an unqualified rows.
 * **Default**: true
 
+### enable_lake_prepared_physical_split_scan
+
+* **Description**: Whether to enable the prepared physical split scan for Cloud-native (lake) tables in a shared-data cluster. When enabled, each segment is pruned once and the resulting prepared read state is shared across the tablet's split children, which can speed up scans of large or skewed tablets. The optimization is decided per scan node and additionally requires a Cloud-native table with Query Cache disabled. Takes effect only in a shared-data cluster.
+* **Default**: false
+* **Data type**: Boolean
+* **Introduced in**: v4.2
+
+### lake_tablet_internal_parallel_skew_split_ratio
+
+* **Description**: The skew threshold that lets a single oversized lake tablet be split under the prepared-physical-split scan even when the scan-range count already reaches the pipeline DOP. A tablet is treated as a skewed straggler and split when its row count exceeds this ratio times the per-driver ideal share (total rows divided by the effective DOP). A larger value requires more extreme skew before splitting; a smaller value splits more eagerly. Must be a positive, finite number. Only affects scans with `enable_lake_prepared_physical_split_scan` enabled, and takes effect only in a shared-data cluster.
+* **Default**: 1.5
+* **Data type**: Double
+* **Introduced in**: v4.2
+
+### enable_lake_prepared_split_on_dup_table_scan
+
+* **Description**: Whether to allow the prepared-physical-split scan on a Cloud-native (lake) table that is scanned by two or more scan operators in the same query (for example, a self-join, or a table referenced multiple times). When `false` (default), such duplicated scans fall back to the regular scan, because the prepared read state that the optimization reuses per scan is unsafe to share across sibling scans of the same table. Set it to `true` to opt those scans back into the optimization. Only affects scans with `enable_lake_prepared_physical_split_scan` enabled, and takes effect only in a shared-data cluster.
+* **Default**: false
+* **Data type**: Boolean
+* **Introduced in**: v4.2
+
 ### enable_lake_tablet_internal_parallel
 
 * **Description**: Whether to enable Parallel Scan for Cloud-native tables in a shared-data cluster.
@@ -1165,6 +1193,13 @@ The following variables tune the back-pressure behavior and only take effect whe
 * **Data Type**: boolean
 * **Introduced in**: v3.2.4
 
+### enable_vector_index_refine
+
+* **Description**: Whether to recompute exact distances from the original vectors and rerank candidates returned by a quantized vector index. This variable applies to IVFPQ and HNSW indexes using the `sq4`, `sq8`, or `pq` quantizer. It has no effect on unquantized HNSW indexes (`quantizer = flat`). Enabling it can improve result accuracy but increases I/O and computation. Use `EXPLAIN` and check `Refine: ON/OFF` to confirm whether refinement is active.
+* **Default**: `false`
+* **Data type**: Boolean
+* **Scope**: Session
+
 ### enable_view_based_mv_rewrite
 
 * **Description**: Whether to enable query rewrite for logical view-based materialized views. If this item is set to `true`, the logical view is used as a unified node to rewrite the queries against itself for better performance. If this item is set to `false`, the system transcribes the queries against logical views into queries against physical tables or materialized views and then rewrites them.
@@ -1301,6 +1336,13 @@ Used for MySQL client compatibility. No practical usage.
 * **Default**: `false`
 * **Data Type**: boolean
 * **Introduced in**: v3.3.0, v3.4.0, v3.5.0
+
+### k_factor
+
+* **Description**: Multiplies the query `LIMIT` to determine how many vector index candidates each Segment returns. Values greater than `1` can improve recall after candidates from multiple Segments are merged, but increase index, memory, and downstream processing costs. The final candidate count is clamped to at least `1`.
+* **Default**: `1`
+* **Data type**: Double
+* **Scope**: Session
 
 ### lake_bucket_assign_mode
 
@@ -1466,6 +1508,13 @@ Used for MySQL client compatibility. No practical usage.
 * **Default**: 3000
 * **Unit**: ms
 
+### one_tablet_opt_max_tablet_rows
+
+* **Description**: Controls the single-tablet optimization by tablet size. When a query is pruned to a single tablet, StarRocks can run the aggregation in a single phase and gather the result on a single node, skipping the shuffle. This is efficient for a small tablet, but serializes the whole query on one node when the tablet is large. If the row count of the selected single tablet exceeds this threshold, the optimization is disabled and a normal distributed (shuffled) plan is used instead. Set it to `-1` to disable this gate and always apply the single-tablet optimization regardless of tablet size.
+* **Default**: 10000000
+* **Data type**: Long
+* **Introduced in**: v4.2
+
 ### optimizer_materialized_view_timelimit
 
 * **Description**: Specifies the maximum time that one materialized view rewrite rule can consume. When the threshold is reached, this rule will not be used for query rewrite.
@@ -1572,6 +1621,13 @@ Used for compatibility with MySQL JDBC versions 8.0.16 and above. No practical u
   * `never`: Never cache the data.
 * **Default**: auto
 * **Introduced in**: v3.3.2
+
+### pq_refine_factor
+
+* **Description**: Additional candidate multiplier for a vector range search when `enable_vector_index_refine` is enabled. It is applied after `k_factor`. Increasing it can improve recall before exact-distance reranking, but increases index, I/O, and distance-computation costs.
+* **Default**: `1`
+* **Data type**: Double
+* **Scope**: Session
 
 ### query_cache_agg_cardinality_limit
 

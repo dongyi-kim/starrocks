@@ -38,7 +38,7 @@
 #include "common/util/thrift_util.h"
 #include "compute_env/global_dict/fragment_dict_state.h"
 #include "compute_env/runtime_range_pruner.hpp"
-#include "exec/hdfs_scanner/hdfs_scanner.h"
+#include "connector/hive/scanner/hdfs_scanner.h"
 #include "exec_primitive/runtime_filter/runtime_filter_helper.h"
 #include "exprs/binary_predicate.h"
 #include "exprs/expr_context.h"
@@ -348,7 +348,6 @@ protected:
     std::string _filter_row_group_path_3 =
             "./be/test/formats/parquet/test_data/file_read_test_filter_row_group_update_rf.parquet";
 
-    std::shared_ptr<RowDescriptor> _row_desc = nullptr;
     RuntimeState* _runtime_state = nullptr;
     std::unique_ptr<FragmentDictState> _fragment_dict_state;
     ObjectPool _pool;

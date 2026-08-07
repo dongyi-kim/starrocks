@@ -78,9 +78,12 @@ add_executable(compute_env_test
         load/time_bounded_stream_load_pipe_test.cpp
         load_path_state_helper_test.cpp
         load_path_mgr_test.cpp
+        local_pass_through_buffer_test.cpp
         profile_report_worker_test.cpp
         query/file_scan_split_context_test.cpp
         query/fragment_runtime_state_test.cpp
+        query/partition_scan_range_pruner_test.cpp
+        query/query_scan_metrics_test.cpp
         query/query_scan_helpers_test.cpp
         query/query_runtime_state_test.cpp
         query_cache_test.cpp

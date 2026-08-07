@@ -428,6 +428,7 @@ import com.starrocks.sql.ast.TabletGroupList;
 import com.starrocks.sql.ast.TabletList;
 import com.starrocks.sql.ast.TagOptions;
 import com.starrocks.sql.ast.TaskName;
+import com.starrocks.sql.ast.TransferLeaderClause;
 import com.starrocks.sql.ast.TruncatePartitionClause;
 import com.starrocks.sql.ast.TruncateTablePartitionStmt;
 import com.starrocks.sql.ast.TruncateTableStmt;
@@ -4646,14 +4647,16 @@ public class AstBuilder extends com.starrocks.sql.parser.StarRocksBaseVisitor<Pa
     public ParseNode visitInstallPluginStatement(com.starrocks.sql.parser.StarRocksParser.InstallPluginStatementContext context) {
         String pluginPath = ((Identifier) visit(context.identifierOrString())).getValue();
         Map<String, String> properties = getCaseSensitiveProperties(context.properties());
-        return new InstallPluginStmt(pluginPath, properties, createPos(context));
+        boolean ifNotExists = context.IF() != null;
+        return new InstallPluginStmt(pluginPath, properties, ifNotExists, createPos(context));
     }
 
     @Override
     public ParseNode visitUninstallPluginStatement(
             com.starrocks.sql.parser.StarRocksParser.UninstallPluginStatementContext context) {
         String pluginPath = ((Identifier) visit(context.identifierOrString())).getValue();
-        return new UninstallPluginStmt(pluginPath, createPos(context));
+        boolean ifExists = context.IF() != null;
+        return new UninstallPluginStmt(pluginPath, ifExists, createPos(context));
     }
 
     // ------------------------------------------------- File Statement ----------------------------------------------------------
@@ -5099,6 +5102,14 @@ public class AstBuilder extends com.starrocks.sql.parser.StarRocksBaseVisitor<Pa
         List<String> clusters =
                 context.string().stream().map(c -> ((StringLiteral) visit(c)).getStringValue()).collect(toList());
         return new ModifyFrontendAddressClause(clusters.get(0), clusters.get(1), createPos(context));
+    }
+
+    @Override
+    public ParseNode visitTransferLeaderClause(
+            com.starrocks.sql.parser.StarRocksParser.TransferLeaderClauseContext context) {
+        String hostPort = ((StringLiteral) visit(context.string())).getStringValue();
+        boolean force = context.FORCE() != null;
+        return new TransferLeaderClause(hostPort, force, createPos(context));
     }
 
     @Override
@@ -10079,7 +10090,7 @@ public class AstBuilder extends com.starrocks.sql.parser.StarRocksBaseVisitor<Pa
             } else {
                 key = metaKeyContext.getText();
             }
-            String alias = ((Identifier) visit(itemContext.alias)).getValue();
+            String alias = itemContext.alias == null ? key : ((Identifier) visit(itemContext.alias)).getValue();
             items.add(new ImportMetadataStmt.Item(key, alias, createPos(itemContext)));
         }
         return new ImportMetadataStmt(items, createPos(context));
