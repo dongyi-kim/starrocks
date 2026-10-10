@@ -297,6 +297,18 @@ Status normalize_op_write_before_save(TxnLogPB::OpWrite* op_write) {
 
 // ---- Top-level walkers --------------------------------------------------------------------------
 
+void force_cloud_native_pk_persistent_index(TabletMetadataPB* tablet_metadata) {
+    // Shared-data primary-key tablets support only the cloud-native persistent index; the
+    // in-memory index and the LOCAL persistent index are deprecated. Auto-upgrade legacy
+    // metadata here so every downstream consumer takes the cloud-native path uniformly.
+    if (tablet_metadata->schema().keys_type() == KeysType::PRIMARY_KEYS &&
+        (!tablet_metadata->enable_persistent_index() ||
+         tablet_metadata->persistent_index_type() != PersistentIndexTypePB::CLOUD_NATIVE)) {
+        tablet_metadata->set_enable_persistent_index(true);
+        tablet_metadata->set_persistent_index_type(PersistentIndexTypePB::CLOUD_NATIVE);
+    }
+}
+
 void normalize_tablet_metadata_after_load(TabletMetadataPB* tablet_metadata) {
     for (auto& rowset_metadata : *tablet_metadata->mutable_rowsets()) {
         normalize_rowset_after_load(&rowset_metadata);
@@ -304,6 +316,10 @@ void normalize_tablet_metadata_after_load(TabletMetadataPB* tablet_metadata) {
     for (auto& rowset_metadata : *tablet_metadata->mutable_compaction_inputs()) {
         normalize_rowset_after_load(&rowset_metadata);
     }
+    // NOTE: the bundle-metadata path clears each tablet's schema before saving and only
+    // restores it AFTER this hook runs, so keys_type() would read as DUP_KEYS here. That
+    // path calls force_cloud_native_pk_persistent_index() again once the schema is back.
+    force_cloud_native_pk_persistent_index(tablet_metadata);
 }
 
 Status normalize_tablet_metadata_before_save(TabletMetadataPB* tablet_metadata) {
@@ -375,6 +391,20 @@ Status normalize_txn_log_before_save(TxnLogPB* txn_log) {
         }
     }
     return Status::OK();
+}
+
+void give_standalone_segments_a_bundle_offset(RowsetMetadataPB* rowset_metadata) {
+    const auto& segment_metas = rowset_metadata->segment_metas();
+    if (std::none_of(segment_metas.begin(), segment_metas.end(),
+                     [](const SegmentMetadataPB& segment_meta) { return segment_meta.has_bundle_file_offset(); })) {
+        return;
+    }
+    for (auto& segment_meta : *rowset_metadata->mutable_segment_metas()) {
+        if (!segment_meta.has_bundle_file_offset() && segment_meta.has_size()) {
+            segment_meta.set_bundle_file_offset(0);
+            segment_meta.set_synthetic_bundle_file_offset(true);
+        }
+    }
 }
 
 } // namespace starrocks::lake

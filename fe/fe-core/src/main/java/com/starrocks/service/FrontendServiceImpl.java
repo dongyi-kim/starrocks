@@ -64,6 +64,7 @@ import com.starrocks.catalog.MaterializedIndexMeta;
 import com.starrocks.catalog.MaterializedView;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
+import com.starrocks.catalog.PartitionAccessTimeMgr;
 import com.starrocks.catalog.PartitionInfo;
 import com.starrocks.catalog.PartitionKey;
 import com.starrocks.catalog.PhysicalPartition;
@@ -91,7 +92,6 @@ import com.starrocks.catalog.system.sys.RoleEdges;
 import com.starrocks.catalog.system.sys.SysFeLocks;
 import com.starrocks.catalog.system.sys.SysFeMemoryUsage;
 import com.starrocks.catalog.system.sys.SysObjectDependencies;
-import com.starrocks.cluster.ClusterNamespace;
 import com.starrocks.common.AlreadyExistsException;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.CaseSensibility;
@@ -178,6 +178,7 @@ import com.starrocks.service.arrow.flight.sql.ArrowFlightSqlConnectContext;
 import com.starrocks.service.arrow.flight.sql.ArrowFlightSqlConnectProcessor;
 import com.starrocks.service.arrow.flight.sql.ArrowFlightSqlProxyQueryManager;
 import com.starrocks.service.arrow.flight.sql.ArrowFlightSqlResultDescriptor;
+import com.starrocks.sql.LoadPlanner;
 import com.starrocks.sql.analyzer.AlterTableClauseAnalyzer;
 import com.starrocks.sql.analyzer.AnalyzerUtils;
 import com.starrocks.sql.analyzer.Authorizer;
@@ -268,6 +269,8 @@ import com.starrocks.thrift.TGetLoadTxnStatusRequest;
 import com.starrocks.thrift.TGetLoadTxnStatusResult;
 import com.starrocks.thrift.TGetLoadsParams;
 import com.starrocks.thrift.TGetLoadsResult;
+import com.starrocks.thrift.TGetPartitionAccessTimesRequest;
+import com.starrocks.thrift.TGetPartitionAccessTimesResponse;
 import com.starrocks.thrift.TGetPartitionsMetaRequest;
 import com.starrocks.thrift.TGetPartitionsMetaResponse;
 import com.starrocks.thrift.TGetProfileRequest;
@@ -353,6 +356,7 @@ import com.starrocks.thrift.TOlapTableIndexTablets;
 import com.starrocks.thrift.TOlapTablePartition;
 import com.starrocks.thrift.TOlapTablePartitionParam;
 import com.starrocks.thrift.TOlapTableTablet;
+import com.starrocks.thrift.TPartitionAccessTimeTableRef;
 import com.starrocks.thrift.TPartitionMeta;
 import com.starrocks.thrift.TPartitionMetaRequest;
 import com.starrocks.thrift.TPartitionMetaResponse;
@@ -428,7 +432,6 @@ import org.jetbrains.annotations.NotNull;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -513,19 +516,18 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         LOG.debug("get db names: {}", dbNames);
 
         List<String> dbs = new ArrayList<>();
-        for (String fullName : dbNames) {
-            final String db = ClusterNamespace.getNameFromFullName(fullName);
+        for (String db : dbNames) {
             if (!PatternMatcher.matchPattern(params.getPattern(), db, matcher, caseSensitive)) {
                 continue;
             }
 
             try {
-                Authorizer.checkAnyActionOnOrInDb(context, catalogName, fullName);
+                Authorizer.checkAnyActionOnOrInDb(context, catalogName, db);
             } catch (AccessDeniedException e) {
                 continue;
             }
 
-            dbs.add(fullName);
+            dbs.add(db);
         }
         result.setDbs(dbs);
         return result;
@@ -606,6 +608,20 @@ public class FrontendServiceImpl implements FrontendService.Iface {
     public TListMaterializedViewStatusResult listMaterializedViewStatus(TGetTablesParams params) throws TException {
         LOG.debug("get list table request: {}", params);
         ConnectContext context = new ConnectContext();
+        // When this is served for a BE schema scan (the non-FE-evaluated information_schema.materialized_views
+        // path, e.g. a LIKE predicate), the BE forwards the outer query's query_timeout. Install the context
+        // as thread-local and stamp its start time so SimpleExecutor.outerRemainingQueryTimeoutS() bounds the
+        // internal task_run_history read by query_timeout instead of statistic_collect_query_timeout.
+        if (params.isSetQuery_timeout() && params.getQuery_timeout() > 0) {
+            context.getSessionVariable().setQueryTimeoutS((int) params.getQuery_timeout());
+            context.setStartTime();
+            context.setThreadLocalInfo();
+            try {
+                return MaterializedViewsSystemTable.query(params, context);
+            } finally {
+                ConnectContext.remove();
+            }
+        }
         return MaterializedViewsSystemTable.query(params, context);
     }
 
@@ -1162,8 +1178,8 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             // authenticate() populates ctx.currentUserIdentity + currentRoleIds (with group-derived roles),
             // so we MUST NOT overwrite them afterward; doing so would drop LDAP/security-integration groups
             // and the OPERATE/NODE checks below would falsely reject privileged callers.
-            AuthenticationHandler.authenticate(ctx, request.getUser(), host,
-                    request.getPasswd().getBytes(StandardCharsets.UTF_8));
+            AuthenticationHandler.authenticateWithClearPassword(ctx, request.getUser(), host,
+                    request.getPasswd());
 
             // getRequired_privilege() can return null when a newer BE sends an enum value
             // this FE doesn't know (TPrivilegeRequirement.findByValue returns null); guard
@@ -1268,13 +1284,13 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         if (checkIsInternalLoad(user, passwd, db, tbl, clientIp)) {
             return UserIdentity.ROOT;
         }
-        UserIdentity currentUser = AuthenticationHandler.authenticate(new ConnectContext(), user, clientIp,
-                passwd.getBytes(StandardCharsets.UTF_8));
+        ConnectContext context = new ConnectContext();
+        UserIdentity currentUser = AuthenticationHandler.authenticateWithClearPassword(
+                context, user, clientIp, passwd);
         // check INSERT action on table
         try {
-            ConnectContext context = new ConnectContext();
-            context.setCurrentUserIdentity(currentUser);
-            context.setCurrentRoleIds(currentUser);
+            // Reuse the context authentication just populated: it already carries the identity and the
+            // group-derived roles. Rebuilding it from currentUser alone would drop those groups.
             Authorizer.checkTableAction(context, db, tbl, PrivilegeType.INSERT);
         } catch (AccessDeniedException e) {
             throw new AuthenticationException(
@@ -1329,11 +1345,9 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         LOG.debug("txn begin request: {}", request);
 
         TLoadTxnBeginResult result = new TLoadTxnBeginResult();
-        // if current node is not master, reject the request
-        if (!GlobalStateMgr.getCurrentState().isLeader()) {
-            TStatus status = new TStatus(TStatusCode.INTERNAL_ERROR);
-            status.setError_msgs(Lists.newArrayList("current fe is not master"));
-            result.setStatus(status);
+        TStatus rejectStatus = rejectIfLeaderLoadTxnAdmissionClosed();
+        if (rejectStatus != null) {
+            result.setStatus(rejectStatus);
             return result;
         }
 
@@ -1442,11 +1456,9 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         LOG.debug("txn commit request: {}", request);
 
         TLoadTxnCommitResult result = new TLoadTxnCommitResult();
-        // if current node is not master, reject the request
-        if (!GlobalStateMgr.getCurrentState().isLeader()) {
-            TStatus status = new TStatus(TStatusCode.INTERNAL_ERROR);
-            status.setError_msgs(Lists.newArrayList("current fe is not master"));
-            result.setStatus(status);
+        TStatus rejectStatus = rejectIfLeaderLoadTxnAdmissionClosed();
+        if (rejectStatus != null) {
+            result.setStatus(rejectStatus);
             return result;
         }
 
@@ -1576,11 +1588,9 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         LOG.debug("txn prepare request: {}", request);
 
         TLoadTxnCommitResult result = new TLoadTxnCommitResult();
-        // if current node is not master, reject the request
-        if (!GlobalStateMgr.getCurrentState().isLeader()) {
-            TStatus status = new TStatus(TStatusCode.INTERNAL_ERROR);
-            status.setError_msgs(Lists.newArrayList("current fe is not master"));
-            result.setStatus(status);
+        TStatus rejectStatus = rejectIfLeaderLoadTxnAdmissionClosed();
+        if (rejectStatus != null) {
+            result.setStatus(rejectStatus);
             return result;
         }
 
@@ -1638,11 +1648,9 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         LOG.debug("txn rollback request: {}", request);
 
         TLoadTxnRollbackResult result = new TLoadTxnRollbackResult();
-        // if current node is not master, reject the request
-        if (!GlobalStateMgr.getCurrentState().isLeader()) {
-            TStatus status = new TStatus(TStatusCode.INTERNAL_ERROR);
-            status.setError_msgs(Lists.newArrayList("current fe is not master"));
-            result.setStatus(status);
+        TStatus rejectStatus = rejectIfLeaderLoadTxnAdmissionClosed();
+        if (rejectStatus != null) {
+            result.setStatus(rejectStatus);
             return result;
         }
 
@@ -1666,6 +1674,26 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         }
 
         return result;
+    }
+
+    private TStatus rejectIfLeaderLoadTxnAdmissionClosed() {
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        if (!globalStateMgr.isLeader()) {
+            return buildLoadTxnRejectStatus("current fe is not master");
+        }
+        if (globalStateMgr.isLeaderDemoting()) {
+            return buildLoadTxnRejectStatus("leader is demoting, submit log is not allowed");
+        }
+        if (!globalStateMgr.isLeaderWorkAdmissionOpen()) {
+            return buildLoadTxnRejectStatus("leader work admission is closed");
+        }
+        return null;
+    }
+
+    private TStatus buildLoadTxnRejectStatus(String message) {
+        TStatus status = new TStatus(TStatusCode.INTERNAL_ERROR);
+        status.setError_msgs(Lists.newArrayList(message));
+        return status;
     }
 
     private void loadTxnRollbackImpl(TLoadTxnRollbackRequest request) throws StarRocksException {
@@ -1781,18 +1809,80 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         }
         try {
             StreamLoadInfo streamLoadInfo = StreamLoadInfo.fromTStreamLoadPutRequest(request, db);
-            StreamLoadPlanner planner = new StreamLoadPlanner(context, db, (OlapTable) table, streamLoadInfo);
-            TExecPlanFragmentParams plan = planner.plan(streamLoadInfo.getId());
 
-            StreamLoadTask streamLoadTask = GlobalStateMgr.getCurrentState().getStreamLoadMgr().
-                    getSyncSteamLoadTaskByTxnId(request.getTxnId());
-            if (streamLoadTask == null) {
-                throw new StarRocksException("can not find stream load task by txnId " + request.getTxnId());
+            TExecPlanFragmentParams plan;
+            Coordinator coord;
+            StreamLoadTask streamLoadTask;
+            // Only take the pipeline path when the requesting BE id is known, so the scan can be
+            // pinned to the BE that owns the StreamLoadPipe. Otherwise fall back to the legacy path.
+            if (Config.enable_pipeline_stream_load && request.isSetBackend_id()) {
+                // The pipeline LoadPlanner needs the task's id + label, so look it up before planning.
+                streamLoadTask = GlobalStateMgr.getCurrentState().getStreamLoadMgr()
+                        .getSyncSteamLoadTaskByTxnId(request.getTxnId());
+                if (streamLoadTask == null) {
+                    throw new StarRocksException("can not find stream load task by txnId " + request.getTxnId());
+                }
+                // Resource-group resolution on the pipeline path reads ctx.getQualifiedUser();
+                // set it here (pipeline path only, so the legacy path is unchanged).
+                context.setQualifiedUser(request.getUser());
+                // The LoadPlanner/JobSpec path derives query_globals.time_zone from the context
+                // session variable, not from streamLoadInfo; set it so the load honors its timezone.
+                context.getSessionVariable().setTimeZone(streamLoadInfo.getTimezone());
+                // Run the classic synchronous stream load on the pipeline engine. Reuse LoadPlanner
+                // (the pipeline-correct planner used by the transaction stream load) so the FILE_STREAM
+                // scan range is assigned as a pipeline morsel, then materialize a single BE-local
+                // TExecPlanFragmentParams WITHOUT an RPC deploy; the receiving BE runs it in-process
+                // (params.is_pipeline routes it to the pipeline engine in StreamLoadOrchestrator).
+                LoadPlanner loadPlanner = new LoadPlanner(streamLoadTask.getId(), streamLoadInfo.getId(),
+                        request.getTxnId(), db.getId(), dbName, (OlapTable) table, streamLoadInfo.isStrictMode(),
+                        streamLoadInfo.getTimezone(), streamLoadInfo.isPartialUpdate(), context, null,
+                        streamLoadInfo.getLoadMemLimit(), streamLoadInfo.getExecMemLimit(), streamLoadInfo.getNegative(),
+                        1, streamLoadInfo.getColumnExprDescs(), streamLoadInfo, streamLoadTask.getLabel(),
+                        streamLoadInfo.getTimeout());
+                loadPlanner.setSyncStreamLoad(true);
+                loadPlanner.setPartialUpdateMode(streamLoadInfo.getPartialUpdateMode());
+                // Pin the scan to the BE that received the HTTP body and owns the pipe
+                // (backend_id is guaranteed set by the branch condition above).
+                loadPlanner.setSyncStreamLoadBackendId(request.getBackend_id());
+                loadPlanner.plan();
+                DefaultCoordinator streamLoadCoord =
+                        (DefaultCoordinator) getCoordinatorFactory().createStreamLoadScheduler(loadPlanner);
+                plan = streamLoadCoord.buildLocalStreamLoadParams();
+                // Carry over load-specific query options the LoadPlanner/JobSpec path does not set
+                // (it reads them from a session-variable map we do not pass), matching legacy StreamLoadPlanner.
+                plan.query_options.setLoad_transmission_compression_type(
+                        streamLoadInfo.getTransmisionCompressionType());
+                plan.query_options.setLog_rejected_record_num(streamLoadInfo.getLogRejectedRecordNum());
+                // Honor table-level / session load-profile collection (matching legacy StreamLoadPlanner),
+                // with the same collect-interval throttle. The pipeline engine reports the profile to the
+                // coordinator, which StreamLoadTask surfaces to ProfileManager on commit.
+                boolean enableLoadProfile = ((OlapTable) table).enableLoadProfile()
+                        || context.getSessionVariable().isEnableLoadProfile();
+                if (Config.load_profile_collect_interval_second > 0
+                        && System.currentTimeMillis() - ((OlapTable) table).getLastCollectProfileTime()
+                                < Config.load_profile_collect_interval_second * 1000) {
+                    enableLoadProfile = false;
+                }
+                if (enableLoadProfile) {
+                    plan.query_options.setEnable_profile(true);
+                    plan.query_options.setLoad_profile_collect_second(
+                            Config.stream_load_profile_collect_threshold_second);
+                    ((OlapTable) table).updateLastCollectProfileTime();
+                }
+                coord = streamLoadCoord;
+            } else {
+                // Legacy path: plan first so a column-map / analysis error surfaces before the task
+                // lookup (relied on by FrontendServiceImplTest.testStreamLoadPutColumnMapException).
+                StreamLoadPlanner planner = new StreamLoadPlanner(context, db, (OlapTable) table, streamLoadInfo);
+                plan = planner.plan(streamLoadInfo.getId());
+                coord = getCoordinatorFactory().createSyncStreamLoadScheduler(planner, getClientAddr());
+                streamLoadTask = GlobalStateMgr.getCurrentState().getStreamLoadMgr()
+                        .getSyncSteamLoadTaskByTxnId(request.getTxnId());
+                if (streamLoadTask == null) {
+                    throw new StarRocksException("can not find stream load task by txnId " + request.getTxnId());
+                }
             }
-
             streamLoadTask.setTUniqueId(request.getLoadId());
-
-            Coordinator coord = getCoordinatorFactory().createSyncStreamLoadScheduler(planner, getClientAddr());
             streamLoadTask.setCoordinator(coord);
             try {
                 QeProcessorImpl.INSTANCE.registerQuery(streamLoadInfo.getId(), coord);
@@ -2187,6 +2277,13 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             }
         }
 
+        // Multi-node write, resolved the same way as on the create-partition path
+        // (buildCreatePartitionResponse): the width this table's plan recorded, and the nodes alive now.
+        final int writerWidth = txnState.getMultiNodeWriteWidth(olapTable.getId());
+        final List<Long> writerCandidates = writerWidth > 1
+                ? OlapTableSink.resolveWriterCandidates(warehouseManager, computeResource)
+                : Collections.emptyList();
+
         // return all mutable partitions
         for (Long id : updatePartitionIds) {
             Partition partition = olapTable.getPartition(id);
@@ -2210,7 +2307,8 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                     TOlapTablePartition tPartition = new TOlapTablePartition();
                     tPartition.setId(physicalPartition.getId());
                     buildPartitions(olapTable, physicalPartition, partitions, tPartition, txnState);
-                    buildTablets(physicalPartition, tablets, olapTable, computeResource, txnState);
+                    buildTablets(physicalPartition, tablets, olapTable, computeResource, txnState,
+                            writerWidth, writerCandidates);
                 }
             } finally {
                 locker.unLockTableWithIntensiveDbLock(db.getId(), tableId, LockType.READ);
@@ -2304,18 +2402,36 @@ public class FrontendServiceImpl implements FrontendService.Iface {
     }
 
     private static void buildTablets(PhysicalPartition physicalPartition, List<TTabletLocation> tablets,
-                                     OlapTable olapTable, ComputeResource computeResource, TransactionState txnState)
+                                     OlapTable olapTable, ComputeResource computeResource, TransactionState txnState,
+                                     int writerWidth, List<Long> writerCandidates)
             throws StarRocksException {
         final WarehouseManager warehouseManager = GlobalStateMgr.getCurrentState().getWarehouseMgr();
         int quorum = olapTable.getPartitionInfo().getQuorumNum(physicalPartition.getParentId(), olapTable.writeQuorum());
         for (MaterializedIndex index : txnState.getPartitionLoadedIndexes(olapTable.getId(), physicalPartition)) {
             if (olapTable.isCloudNativeTable()) {
+                int tabletCount = index.getTablets().size();
                 for (Tablet tablet : index.getTablets()) {
+                    // Every sink instance of the load sends this RPC on its own, and each response
+                    // lists every mutable sub-partition, including ones an earlier call created. Key-hash
+                    // routing needs all instances to see the SAME node list for a tablet, so the first
+                    // answer for a tablet is kept for the rest of the transaction, as the create-partition
+                    // path does. BE keeps the first location it gets for a tablet, so answering a tablet the
+                    // sink already knows from its plan changes nothing there.
+                    TTabletLocation cached = txnState.getTabletIdToTTabletLocation().get(tablet.getId());
+                    if (cached != null) {
+                        tablets.add(cached);
+                        continue;
+                    }
                     try {
                         // use default warehouse nodes
                         ComputeNode computeNode = warehouseManager.getComputeNodeAssignedToTablet(computeResource,
                                 tablet.getId());
-                        tablets.add(new TTabletLocation(tablet.getId(), Collections.singletonList(computeNode.getId())));
+                        TTabletLocation tabletLocation = new TTabletLocation(tablet.getId(),
+                                OlapTableSink.buildRuntimePartitionNodeIds(computeNode.getId(), writerCandidates,
+                                        writerWidth, tabletCount, tablet.getId()));
+                        TTabletLocation previous =
+                                txnState.getTabletIdToTTabletLocation().putIfAbsent(tablet.getId(), tabletLocation);
+                        tablets.add(previous != null ? previous : tabletLocation);
                     } catch (Exception exception) {
                         throw new StarRocksException("Check if any backend is down or not. tablet_id: " + tablet.getId());
                     }
@@ -2541,7 +2657,8 @@ public class FrontendServiceImpl implements FrontendService.Iface {
 
         // Step 2: Validate transaction state
         TransactionState txnState = state.getGlobalTransactionMgr().getTransactionState(db.getId(), txnId);
-        TCreatePartitionResult errorResult = validateTransactionState(txnState, txnId, tableId, olapTable.getName());
+        TCreatePartitionResult errorResult =
+                validateTransactionState(txnState, txnId, tableId, olapTable.getName(), creatingPartitionNames);
         metrics.recordValidateTxnState();
         if (errorResult != null) {
             return errorResult;
@@ -2647,13 +2764,23 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         return new ValidatedTableInfo(db, olapTable);
     }
 
+    /**
+     * Validate the transaction and the per-load partition budget.
+     *
+     * <p>The budget is counted over the partitions this transaction would have touched once the request is
+     * served, i.e. the union of the partitions already cached on the transaction and {@code creatingPartitionNames}.
+     */
     private static TCreatePartitionResult validateTransactionState(TransactionState txnState, long txnId,
-                                                                   long tableId, String tableName) {
+                                                                   long tableId, String tableName,
+                                                                   Set<String> creatingPartitionNames) {
         if (txnState == null) {
             return buildErrorResult(String.format("automatic create partition failed. error: txn %d not exist", txnId));
         }
 
-        if (txnState.getPartitionNameToTPartition(tableId).size() > Config.max_partitions_in_one_batch) {
+        ConcurrentMap<String, TOlapTablePartition> cachedPartitions = txnState.getPartitionNameToTPartition(tableId);
+        long partitionNumAfterRequest = cachedPartitions.size()
+                + creatingPartitionNames.stream().filter(name -> !cachedPartitions.containsKey(name)).count();
+        if (partitionNumAfterRequest > Config.max_partitions_in_one_batch) {
             return buildErrorResult(String.format(
                     "Table %s automatic create partition failed. error: partitions in one batch exceed limit %d," +
                             "You can modify this restriction on by setting max_partitions_in_one_batch larger.",
@@ -2922,6 +3049,17 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             result.setStatus(errorStatus);
             return result;
         }
+        // Multi-node write: the width OlapTableSink.createLocation resolved for THIS table when this
+        // load was planned, and the nodes alive now to spend it on. A load long enough to create a
+        // partition can outlive the node list it was planned against, so the candidates are resolved
+        // here rather than carried. Both are left at their no-spread values unless that table's plan
+        // recorded a width, which it does only for a table whose own sink also carries
+        // enable_multi_node_write -- see TransactionState. Asking per table matters because one
+        // transaction can carry several and only some of them may be eligible.
+        final int writerWidth = txnState.getMultiNodeWriteWidth(olapTable.getId());
+        final List<Long> writerCandidates = writerWidth > 1
+                ? OlapTableSink.resolveWriterCandidates(warehouseManager, computeResource)
+                : Collections.emptyList();
         for (String partitionName : partitionNames) {
             // get partition info from snapshot
             TOlapTablePartition tPartition = txnState.getPartitionNameToTPartition(olapTable.getId()).get(partitionName);
@@ -2954,6 +3092,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             for (MaterializedIndex index :
                     txnState.getPartitionLoadedIndexesWithoutLock(olapTable.getId(), physicalPartition)) {
                 if (olapTable.isCloudNativeTable()) {
+                    int tabletCount = index.getTablets().size();
                     for (Tablet tablet : index.getTablets()) {
                         try {
                             // use default warehouse nodes
@@ -2965,8 +3104,13 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                                 result.setStatus(errorStatus);
                                 return result;
                             }
+                            // One node unless this load spreads a tablet's write, which is the whole reason
+                            // a brand-new partition -- typically one tablet, since its data boundaries have
+                            // not been seen yet -- would otherwise funnel through a single node for the rest
+                            // of the load.
                             TTabletLocation tabletLocation = new TTabletLocation(tablet.getId(),
-                                    Collections.singletonList(computeNodeId));
+                                    OlapTableSink.buildRuntimePartitionNodeIds(computeNodeId, writerCandidates,
+                                            writerWidth, tabletCount, tablet.getId()));
                             tablets.add(tabletLocation);
                             txnState.getTabletIdToTTabletLocation().put(tablet.getId(), tabletLocation);
                         } catch (Exception exception) {
@@ -3106,6 +3250,23 @@ public class FrontendServiceImpl implements FrontendService.Iface {
     @Override
     public TGetPartitionsMetaResponse getPartitionsMeta(TGetPartitionsMetaRequest request) throws TException {
         return InformationSchemaDataSource.generatePartitionsMetaResponse(request);
+    }
+
+    @Override
+    public TGetPartitionAccessTimesResponse getPartitionAccessTimes(TGetPartitionAccessTimesRequest request)
+            throws TException {
+        TGetPartitionAccessTimesResponse response = new TGetPartitionAccessTimesResponse();
+        PartitionAccessTimeMgr accessTimeMgr = GlobalStateMgr.getCurrentState().getPartitionAccessTimeMgr();
+        Map<Long, Long> result = new HashMap<>();
+        List<TPartitionAccessTimeTableRef> tables = request.getTables();
+        // When access-time collection is disabled this FE contributes nothing; return an empty (OK) response
+        // so a peer's aggregation still sees a successful reply.
+        if (tables != null && Config.enable_collect_partition_access_time) {
+            result.putAll(accessTimeMgr.getLocalAccessTimes(tables));
+        }
+        response.setPartition_id_to_access_time_ms(result);
+        response.setStatus(new TStatus(TStatusCode.OK));
+        return response;
     }
 
     @Override
@@ -3740,7 +3901,10 @@ public class FrontendServiceImpl implements FrontendService.Iface {
     public TUpdateFailPointResponse updateFailPointStatus(TUpdateFailPointRequest request) {
         TStatus status = new TStatus();
         if (FailPoint.isEnabled()) {
-            if (request.isIs_enable()) {
+            // Not `request.isIs_enable()`: a pause request deliberately carries is_enable = false so
+            // that an FE predating the pause field removes the policy instead of arming an ENABLE it
+            // cannot honour. isArming() is what keeps a pause from being read as a removal here.
+            if (TriggerPolicy.isArming(request)) {
                 FailPoint.setTriggerPolicy(request.getName(), TriggerPolicy.fromThrift(request));
             } else {
                 FailPoint.removeTriggerPolicy(request.getName());

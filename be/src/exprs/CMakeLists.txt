@@ -26,9 +26,15 @@ set(EXPR_FILES
   agg/factory/aggregate_factory.cpp
   agg/factory/aggregate_resolver_approx.cpp
   agg/factory/aggregate_resolver_avg.cpp
+  agg/factory/aggregate_resolver_sum_map1.cpp
+  agg/factory/aggregate_resolver_sum_map2.cpp
+  agg/factory/aggregate_resolver_sum_map3.cpp
   agg/factory/aggregate_resolver_boolean.cpp
   agg/factory/aggregate_resolver_hypothesis_testing.cpp
   agg/factory/aggregate_resolver_minmaxany.cpp
+  agg/factory/aggregate_resolver_maxminby1.cpp
+  agg/factory/aggregate_resolver_maxminby2.cpp
+  agg/factory/aggregate_resolver_maxminby3.cpp
   agg/factory/aggregate_resolver_others.cpp
   agg/factory/aggregate_resolver_sumcount.cpp
   agg/factory/aggregate_resolver_distinct.cpp
@@ -43,6 +49,9 @@ set(EXPR_FILES
   sort_exec_exprs.cpp
   array_element_expr.cpp
   array_expr.cpp
+  ai/ai_function_call_expr.cpp
+  ai/ai_function_result.cpp
+  ai/ai_provider_options_builder.cpp
   ai_functions.cpp
   array_functions.cpp
   array_map_expr.cpp
@@ -53,9 +62,15 @@ set(EXPR_FILES
   bitmap_functions.cpp
   cast_nested.cpp
   cast_expr.cpp
+  cast_expr_g1.cpp
+  cast_expr_g2.cpp
+  cast_expr_g3.cpp
   cast_expr_array.cpp
   cast_expr_struct.cpp
   case_expr.cpp
+  case_expr_g1.cpp
+  case_expr_g2.cpp
+  case_expr_g3.cpp
   cast_expr_json.cpp
   cast_expr_map.cpp
   chunk_predicate_evaluator.cpp
@@ -71,6 +86,7 @@ set(EXPR_FILES
   function_helper.cpp
   find_in_set.cpp
   geo_functions.cpp
+  h3_functions.cpp
   gin_functions.cpp
   grouping_sets_functions.cpp
   hash_functions.cpp
@@ -124,6 +140,7 @@ set(EXPR_FILES
   agg/java_window_function.cpp
   table_function/java_udtf_function.cpp
   java_function_call_expr.cpp
+  ds_theta_functions.cpp
 )
 
 if(STARROCKS_JIT_ENABLE)

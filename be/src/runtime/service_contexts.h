@@ -19,8 +19,14 @@
 namespace starrocks {
 
 class AgentServer;
+class AIAdmissionController;
+class AIClock;
+class AICompletionExecutor;
+class AIHttpClient;
+class AIMetrics;
+class AIRandom;
+class AIRuntimeConfigSource;
 class BackendServiceClient;
-class BatchWriteMgr;
 class BrokerMgr;
 class BrpcStubCache;
 class DataStreamMgr;
@@ -37,10 +43,8 @@ class RuntimeFilterQueryLifecycle;
 class RuntimeFilterSender;
 class StorePathRegistry;
 class StreamContextMgr;
-class StreamLoadExecutor;
 class TFileBrokerServiceClient;
 class ThreadPool;
-class TransactionMgr;
 class FrontendServiceClient;
 class LoadSpillBlockMergeExecutor;
 class MetricRegistry;
@@ -118,9 +122,6 @@ struct RuntimeServices {
     BaseLoadPathMgr* load_path_mgr = nullptr;
     LoadStreamMgr* load_stream_mgr = nullptr;
     StreamContextMgr* stream_context_mgr = nullptr;
-    TransactionMgr* transaction_mgr = nullptr;
-    BatchWriteMgr* batch_write_mgr = nullptr;
-    StreamLoadExecutor* stream_load_executor = nullptr;
     RuntimeFilterSender* runtime_filter_sender = nullptr;
     RuntimeFilterQueryLifecycle* runtime_filter_query_lifecycle = nullptr;
     RuntimeFilterCache* runtime_filter_cache = nullptr;
@@ -138,10 +139,22 @@ struct AgentServices {
     AgentServer* agent_server = nullptr;
 };
 
+// Stable, non-owning query-execution view over the process AI runtime owned by ComputeEnv.
+struct AIServices {
+    const AIRuntimeConfigSource* config_source = nullptr;
+    AIAdmissionController* admission_controller = nullptr;
+    AIHttpClient* http_client = nullptr;
+    AICompletionExecutor* completion_executor = nullptr;
+    const AIClock* clock = nullptr;
+    AIRandom* random = nullptr;
+    AIMetrics* metrics = nullptr;
+};
+
 struct QueryExecutionServices {
     const ExecutionEnv* execution = nullptr;
     const RpcServices* rpc = nullptr;
     const RuntimeServices* runtime = nullptr;
+    const AIServices* ai = nullptr;
     MetricRegistry* process_metrics = nullptr;
 };
 

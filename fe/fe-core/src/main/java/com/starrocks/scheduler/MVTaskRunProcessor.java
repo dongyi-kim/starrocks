@@ -95,6 +95,13 @@ public class MVTaskRunProcessor extends BaseTaskRunProcessor implements MVRefres
     public MVTaskRunProcessor() {
     }
 
+    @Override
+    public void postTaskRun(TaskRunContext context) {
+        // Older MV tasks may still have an ANALYZE statement persisted in postRun. MV refresh no longer
+        // generates this statement, so do not let the generic task post-processor execute the legacy value.
+        // Statistics maintenance for refreshed partitions is handled by the insert-overwrite path.
+    }
+
     @VisibleForTesting
     @Override
     public TaskRunContext prepare(TaskRunContext context) throws Exception {
@@ -160,11 +167,12 @@ public class MVTaskRunProcessor extends BaseTaskRunProcessor implements MVRefres
     }
 
     /**
-     * Get the execution plan for refreshing the materialized view.
-     * @return the execution plan for refreshing the materialized view, or null if no refresh is needed.
+     * Build the refresh plan for the materialized view, keeping the skip reason so the caller can tell why
+     * there is no plan.
+     * @return the would-be task run result; its execPlan is null when nothing was planned
      * @throws Exception if an error occurs while getting the execution plan.
      */
-    public ExecPlan getMVRefreshExecPlan() throws Exception {
+    public MVRefreshProcessor.ProcessExecPlan getMVRefreshProcessExecPlan() throws Exception {
         Preconditions.checkNotNull(mvTaskRunContext);
         Preconditions.checkNotNull(mvRefreshProcessor);
 
@@ -174,10 +182,11 @@ public class MVTaskRunProcessor extends BaseTaskRunProcessor implements MVRefres
         MVRefreshProcessor.ProcessExecPlan processExecPlan =
                 mvRefreshProcessor.getProcessExecPlan(mvTaskRunContext);
         if (processExecPlan == null || processExecPlan.state() != Constants.TaskRunState.SUCCESS) {
-            logger.info("No need to refresh mv: {}, because the materialized view is up to date.", mv.getName());
-            return null;
+            logger.info("No refresh plan for mv: {}, state: {}, skip reason: {}", mv.getName(),
+                    processExecPlan == null ? null : processExecPlan.state(),
+                    processExecPlan == null ? null : processExecPlan.skipReason());
         }
-        return processExecPlan.execPlan();
+        return processExecPlan;
     }
 
     @Override
@@ -391,6 +400,8 @@ public class MVTaskRunProcessor extends BaseTaskRunProcessor implements MVRefres
             throw e;
         } finally {
             logger.info("[QueryId:{}] finished to refresh mv in DML", ctx.getQueryId());
+            // the MV refresh uses its own fresh ConnectContext whose audit builder starts at the default value.
+            executor.recordExecStatsIntoContext();
             auditAfterExec(mvTaskRunContext, executor.getParsedStmt(), executor.getQueryStatisticsForAuditLog());
             executor.addFinishedQueryDetail();
         }

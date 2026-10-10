@@ -46,6 +46,7 @@ set(STORAGE_FILES
     segment_flush_executor.cpp
     segment_replicate_executor.cpp
     metadata_util.cpp
+    non_closing_chunk_iterator.cpp
     kv_store.cpp
     local_tablet_reader.cpp
     olap_server.cpp
@@ -158,6 +159,7 @@ set(STORAGE_FILES
     lake_meta_reader.cpp
     olap_meta_reader.cpp
     seek_tuple.cpp
+    sort_key_sampler.cpp
     unique_iterator.cpp
     delta_writer.cpp
     memtable.cpp
@@ -185,7 +187,9 @@ set(STORAGE_FILES
     lake/compaction_policy.cpp
     lake/compaction_scheduler.cpp
     lake/compaction_task.cpp
+    lake/cross_publish_context.cpp
     lake/compaction_task_context.cpp
+    lake/combined_txn_log_writer.cpp
     lake/tablet_parallel_compaction_manager.cpp
     lake/horizontal_compaction_task.cpp
     lake/delta_writer.cpp
@@ -195,11 +199,12 @@ set(STORAGE_FILES
     lake/general_tablet_writer.cpp
     lake/pk_tablet_writer.cpp
     lake/pk_tablet_sst_writer.cpp
+    lake/pk_tablet_unsort_sst_writer.cpp
     lake/primary_key_compaction_policy.cpp
     lake/tablet_reshard_helper.cpp
     lake/tablet_splitter.cpp
     lake/tablet_merger.cpp
-    lake/tablet_merger_split_family.cpp
+    lake/tablet_virtual_merge.cpp
     lake/tablet_reshard.cpp
     lake/replication_txn_manager.cpp
     lake/lake_replication_txn_manager.cpp
@@ -217,6 +222,7 @@ set(STORAGE_FILES
     lake/tablet_manager.cpp
     lake/tablet_reader.cpp
     lake/tablet_range_helper.cpp
+    lake/multi_node_write_txn_log.cpp
     lake/sst_seek_range.cpp
     lake/transactions.cpp
     lake/metadata_iterator.cpp
@@ -224,7 +230,6 @@ set(STORAGE_FILES
     lake/rowset_update_state.cpp
     lake/segment_pk_iterator.cpp
     lake/meta_file.cpp
-    lake/lake_primary_index.cpp
     lake/versioned_tablet.cpp
     lake/vertical_compaction_task.cpp
     lake/cloud_native_index_compaction_task.cpp
@@ -261,13 +266,13 @@ set(STORAGE_FILES
     binlog_reader.cpp
     lake/update_compaction_state.cpp
     lake/txn_log_applier.cpp
-    lake/lake_local_persistent_index.cpp
     persistent_index_compaction_manager.cpp
     persistent_index_load_executor.cpp
     lake/local_pk_index_manager.cpp
     persistent_index_tablet_loader.cpp
-    lake/lake_local_persistent_index_tablet_loader.cpp
     lake/lake_persistent_index.cpp
+    lake/parallel_task_runner.cpp
+    parallel_upsert_context.cpp
     lake/persistent_index_memtable.cpp
     lake/local_pk_index_manager.cpp
     lake/persistent_index_sstable.cpp
@@ -287,7 +292,6 @@ set(STORAGE_FILES
     index/inverted/clucene/clucene_inverted_writer.cpp
     index/inverted/clucene/clucene_inverted_reader.cpp
     index/inverted/clucene/match_operator.cpp
-    index/vector/empty_index_reader.cpp
     index/vector/vector_index_cache.cpp
     index/vector/vector_index_cache_metrics.cpp
     index/vector/vector_index_builder_factory.cpp
@@ -321,3 +325,4 @@ ADD_BE_LIB(Storage
 )
 
 target_link_libraries(Storage PUBLIC StorageBase StoragePrimitive ExecPrimitive ComputeEnv Platform Cache)
+target_link_libraries(Storage PRIVATE Runtime)

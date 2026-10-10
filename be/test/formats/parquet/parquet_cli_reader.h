@@ -18,7 +18,7 @@
 
 #include "common/config_exec_fwd.h"
 #include "common/status.h"
-#include "exec/hdfs_scanner/hdfs_scanner_context.h"
+#include "connector/hive/scanner/hdfs_scanner_context.h"
 #include "formats/parquet/file_reader.h"
 #include "fs/fs.h"
 #include "runtime/descriptor_helper.h"
@@ -137,6 +137,8 @@ private:
                 ASSIGN_OR_RETURN(auto child_type, _build_type(i));
                 type.children.emplace_back(child_type);
             }
+        } else if (field.type == ColumnType::VARIANT) {
+            type = TypeDescriptor::create_variant_type();
         } else if (field.type == ColumnType::ARRAY) {
             type.type = TYPE_ARRAY;
             ASSIGN_OR_RETURN(auto child_type, _build_type(field.children[0]));
@@ -229,8 +231,7 @@ private:
         std::vector<TTupleId> row_tuples = std::vector<TTupleId>{0};
         DescriptorTbl* tbl = nullptr;
         CHECK(DescriptorTbl::create(state, pool, table_desc_builder.desc_tbl(), &tbl, config::vector_chunk_size).ok());
-        RowDescriptor* row_desc = pool->add(new RowDescriptor(*tbl, row_tuples));
-        return row_desc->tuple_descriptors()[0];
+        return tbl->get_tuple_descriptor(row_tuples[0]);
     }
 
     static void _make_column_info_vector(const TupleDescriptor* tuple_desc, std::vector<FormatColumnInfo>* columns) {

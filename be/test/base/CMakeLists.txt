@@ -74,6 +74,7 @@ set(BASE_TEST_FILES
     random/random_test.cpp
     simd/byte_stream_split_test.cpp
     simd/batch_run_counter_test.cpp
+    simd/filter_test.cpp
     simd/simd_expand_test.cpp
     simd/simd_test.cpp
     simd/rle_simd_test.cpp
@@ -87,6 +88,7 @@ set(BASE_TEST_FILES
     string/string_search_test.cpp
     string/string_searcher_test.cpp
     string/string_util_test.cpp
+    string/trim_test.cpp
     string/string_parser_test.cpp
     string/slice_test.cpp
     string/url_parser_test.cpp
@@ -97,6 +99,7 @@ set(BASE_TEST_FILES
     time/ratelimit_test.cpp
     time/monotime_test.cpp
     time/timezone_utils_test.cpp
+    time/tz_offset_cache_test.cpp
     types/numeric_types_test.cpp
     utility/integer_util_test.cpp
     utility/pretty_printer_test.cpp
@@ -108,9 +111,9 @@ set(BASE_TEST_FILES
     status_test.cpp
 )
 
-if (USE_AVX512)
-    list(APPEND BASE_TEST_FILES simd/delta_decode_test.cpp)
-endif()
+# delta_decode_test guards each ISA kernel with a runtime __builtin_cpu_supports check, so it is
+# built (and meaningfully exercises the AVX2/AVX-512 kernels on capable CPUs) regardless of USE_AVX512.
+list(APPEND BASE_TEST_FILES simd/delta_decode_test.cpp)
 
 set(BASE_TEST_LINK_LIBS
     Base

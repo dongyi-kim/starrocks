@@ -96,6 +96,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Type;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -125,6 +126,31 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
             }
         }
         SETTER_MAP = builder.build();
+    }
+
+    /**
+     * How a load may spread one tablet's write across compute nodes.
+     *
+     * <p>AUTO covers the one shape that has no other way to fill the cluster: a table on a
+     * range-bucket distribution whose partition still has fewer tablets than the load is worth
+     * writers -- i.e. pre-split did not run or did not manage to split. Every key type qualifies:
+     * rows sharing a key are routed by a hash of the key columns and so meet in one writer, which
+     * leaves nothing about the result depending on which node wrote which row, and therefore nothing
+     * to put to the user before turning it on.
+     *
+     * <p>A hash-bucket table is left to FORCE -- not because spreading it would be wrong, but
+     * because it can simply be given more buckets to fill the cluster.
+     */
+    public enum MultiNodeTabletWriteMode {
+        OFF,
+        AUTO,
+        FORCE
+    }
+
+    public enum PaimonReaderMode {
+        AUTO,
+        JNI,
+        NATIVE
     }
 
     public enum BinaryEncodingFormat {
@@ -245,6 +271,52 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     public static final String BINARY_ENCODING_FORMAT = "binary_encoding_format";
     public static final String BINARY_ENCODING_LEVEL = "binary_encoding_level";
 
+    /**
+     * Shared-data only. When on, a load writes each row into a delta writer on the compute node its
+     * sink instance already runs on, instead of sending it to the single node the tablet is assigned
+     * to. That both spreads a single tablet's write across the cluster and removes the network hop.
+     * <p>
+     * Only takes effect while a partition has fewer tablets than the width this load is actually
+     * spread over -- the smallest of the size-derived node count, lake_multi_node_write_max_nodes,
+     * and the alive compute nodes (createLocation's spreadsIndex). NOT the warehouse size: a load
+     * worth three writers landing on a five-tablet partition is already spread wider than it asked
+     * for, and above that width bucket-level parallelism already fills the cluster, so writing
+     * locally would give up read-side cache locality (a tablet has one owner and scans are
+     * scheduled to it) for nothing.
+     * <p>
+     * Rows sharing a key are not spread across nodes: an aggregate, unique or primary key table
+     * routes by a hash of the key columns, so all of a key's rows reach one node and resolve against
+     * each other in arrival order exactly as they do on the single-node path. A DUPLICATE KEY table
+     * keeps every row where it was produced, its rowset being the union of its segments.
+     */
+    public static final String LAKE_MULTI_NODE_TABLET_WRITE_MODE = "lake_multi_node_tablet_write_mode";
+
+    /**
+     * Upper bound on how many compute nodes may write ONE tablet. Every node in a tablet's location
+     * opens its own delta writer and produces its own segments, so a very wide warehouse would split
+     * one load into many small segments. Nodes left out still run their sink instance -- their rows
+     * travel, which is the behaviour that existed before this feature -- so the bound costs locality
+     * but never correctness. <= 0 means no bound (every alive compute node).
+     */
+    public static final String LAKE_MULTI_NODE_WRITE_MAX_NODES = "lake_multi_node_write_max_nodes";
+
+    /**
+     * How many bytes of a load one node should be given before another node is added to a tablet's
+     * write set. The node count is the estimated load size divided by this, then capped by
+     * lake_multi_node_write_max_nodes and by the number of alive compute nodes.
+     * <p>
+     * Spreading is not free: every node in a tablet's node list writes its own segments and emits its
+     * own partial txn log, and open/close reach every node in that list whether or not it ends up with
+     * any rows. So a small load spread wide pays one extra segment and one extra log per node and gets
+     * little back -- the measured speedup is ~1.35x at 5 GB against ~3x at 20-50 GB.
+     * <p>
+     * Which is why streaming ingest is refused outright rather than sized (OlapTableSink.
+     * writerNodeCount): stream and routine load set no estimate, so sizing them would fall back to
+     * lake_multi_node_write_max_nodes and hand the widest spread to the smallest, most frequent
+     * writes -- precisely the cost this knob exists to bound.
+     */
+    public static final String LAKE_MULTI_NODE_WRITE_BYTES_PER_NODE = "lake_multi_node_write_bytes_per_node";
+
     public static final String ENABLE_LOAD_PROFILE = "enable_load_profile";
     public static final String PROFILING = "profiling";
     public static final String SQL_MODE = "sql_mode";
@@ -304,6 +376,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     public static final String DYNAMIC_OVERWRITE = "dynamic_overwrite";
     public static final String ENABLE_CACHE_UDAF = "enable_cache_udaf";
     public static final String ENABLE_SPILL = "enable_spill";
+
+    public static final String ENABLE_LAKE_PREPARED_PHYSICAL_SPLIT_SCAN =
+            "enable_lake_prepared_physical_split_scan";
     public static final String ENABLE_SPILL_TO_REMOTE_STORAGE = "enable_spill_to_remote_storage";
     public static final String DISABLE_SPILL_TO_LOCAL_DISK = "disable_spill_to_local_disk";
     public static final String SPILLABLE_OPERATOR_MASK = "spillable_operator_mask";
@@ -415,6 +490,12 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public static final String ENABLE_LAKE_TABLET_INTERNAL_PARALLEL = "enable_lake_tablet_internal_parallel";
 
+    public static final String LAKE_TABLET_INTERNAL_PARALLEL_SKEW_SPLIT_RATIO =
+            "lake_tablet_internal_parallel_skew_split_ratio";
+
+    public static final String ENABLE_LAKE_PREPARED_SPLIT_ON_DUP_TABLE_SCAN =
+            "enable_lake_prepared_split_on_dup_table_scan";
+
     public static final String TABLET_INTERNAL_PARALLEL_MODE = "tablet_internal_parallel_mode";
     public static final String ENABLE_SHARED_SCAN = "enable_shared_scan";
     public static final String PIPELINE_DOP = "pipeline_dop";
@@ -519,6 +600,7 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     public static final String CBO_MAX_REORDER_NODE = "cbo_max_reorder_node";
     public static final String CBO_PRUNE_SHUFFLE_COLUMN_RATE = "cbo_prune_shuffle_column_rate";
     public static final String CBO_PUSH_DOWN_AGGREGATE_MODE = "cbo_push_down_aggregate_mode";
+    public static final String CBO_PUSH_DOWN_COUNT_AGGREGATE = "cbo_push_down_count_aggregate";
     public static final String CBO_PUSH_DOWN_AGGREGATE_ON_BROADCAST_JOIN = "cbo_push_down_aggregate_on_broadcast_join";
     public static final String CBO_PUSH_DOWN_AGGREGATE_ON_BROADCAST_JOIN_ROW_COUNT_LIMIT =
             "cbo_push_down_aggregate_on_broadcast_join_row_count_limit";
@@ -624,6 +706,8 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public static final String ENABLE_READ_ICEBERG_PUFFIN_NDV = "enable_read_iceberg_puffin_ndv";
 
+    public static final String ENABLE_ICEBERG_V3_DELETION_VECTOR = "enable_iceberg_v3_deletion_vector";
+
     public static final String ENABLE_ICEBERG_COLUMN_STATISTICS = "enable_iceberg_column_statistics";
     public static final String ENABLE_READ_ICEBERG_EQUALITY_DELETE_WITH_PARTITION_EVOLUTION =
             "enable_read_iceberg_equality_delete_with_partition_evolution";
@@ -702,6 +786,13 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public static final String STATISTIC_META_COLLECT_PARALLEL = "statistic_meta_collect_parallel";
 
+    // Bounded-cost external-table statistics-scan budgets. Set by the external ANALYZE job (from Config or
+    // ANALYZE ... PROPERTIES) and read by IcebergScanNode when building connector scan params; INVISIBLE
+    // because they are an internal transport channel, not a user-tunable knob.
+    public static final String EXTERNAL_STATS_SCAN_BYTES_CAP = "external_stats_scan_bytes_cap";
+    public static final String EXTERNAL_STATS_SCAN_FILES_CAP = "external_stats_scan_files_cap";
+    public static final String EXTERNAL_STATS_SCAN_ROWS_CAP = "external_stats_scan_rows_cap";
+
     public static final String ENABLE_ANALYZE_PHASE_PRUNE_COLUMNS = "enable_analyze_phase_prune_columns";
 
     public static final String ENABLE_SHOW_ALL_VARIABLES = "enable_show_all_variables";
@@ -748,6 +839,7 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     public static final String ENABLE_FILE_PAGECACHE = "enable_file_pagecache";
     public static final String HUDI_MOR_FORCE_JNI_READER = "hudi_mor_force_jni_reader";
     public static final String PAIMON_FORCE_JNI_READER = "paimon_force_jni_reader";
+    public static final String PAIMON_READER_MODE = "paimon_reader_mode";
     public static final String AVRO_USE_JNI_READER = "avro_use_jni_reader";
     public static final String ENABLE_DYNAMIC_PRUNE_SCAN_RANGE = "enable_dynamic_prune_scan_range";
     public static final String IO_TASKS_PER_SCAN_OPERATOR = "io_tasks_per_scan_operator";
@@ -941,6 +1033,8 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public static final String GROUP_CONCAT_MAX_LEN = "group_concat_max_len";
 
+    public static final String MAX_ARRAY_LENGTH = "max_array_length";
+
     // These parameters are experimental. They may be removed in the future
     public static final String SPILL_MEM_TABLE_SIZE = "spill_mem_table_size";
     public static final String SPILL_MEM_TABLE_NUM = "spill_mem_table_num";
@@ -980,6 +1074,7 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     public static final String ENABLE_FORCE_GROUP_BY_SKEW_ELIMINATE_WHEN_SKEWED =
             "enable_force_group_by_skew_eliminate_when_skewed";
     public static final String ENABLE_SPLIT_WINDOW_SKEW_TO_UNION = "enable_split_window_skew_to_union";
+    public static final String ENABLE_WINDOW_SKEW_MERGE_SORT = "enable_window_skew_merge_sort";
     public static final String HDFS_BACKEND_SELECTOR_SCAN_RANGE_SHUFFLE = "hdfs_backend_selector_scan_range_shuffle";
 
     public static final String SQL_QUOTE_SHOW_CREATE = "sql_quote_show_create";
@@ -997,6 +1092,8 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     public static final String SCAN_OR_TO_UNION_LIMIT = "scan_or_to_union_limit";
 
     public static final String SCAN_OR_TO_UNION_THRESHOLD = "scan_or_to_union_threshold";
+
+    public static final String ONE_TABLET_OPT_MAX_TABLET_ROWS = "one_tablet_opt_max_tablet_rows";
 
     public static final String ENABLE_PUSHDOWN_OR_PREDICATE = "enable_pushdown_or_predicate";
     public static final String ENABLE_SHOW_PREDICATE_TREE_IN_PROFILE = "enable_show_predicate_tree_in_profile";
@@ -1039,6 +1136,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     public static final String INTERLEAVING_GROUP_SIZE = "interleaving_group_size";
 
     public static final String CBO_PUSHDOWN_TOPN_LIMIT = "cbo_push_down_topn_limit";
+
+    public static final String ENABLE_AI_TOPN_PUSHDOWN = "enable_ai_topn_pushdown";
+    public static final String AI_TOPN_PUSHDOWN_MAX_GLOBAL_LIMIT = "ai_topn_pushdown_max_global_limit";
 
     public static final String CBO_PUSHDOWN_DISTINCT_LIMIT = "cbo_push_down_distinct_limit";
 
@@ -1138,6 +1238,8 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public static final String ENABLE_SCAN_PREDICATE_EXPR_REUSE = "enable_scan_predicate_expr_reuse";
     public static final String ENABLE_PREDICATE_EXPR_REUSE = "enable_predicate_expr_reuse";
+    public static final String ENABLE_SHARE_JSON_PARSE = "enable_share_json_parse";
+    public static final String SHARE_JSON_PARSE_MIN_EXTRACTIONS = "share_json_parse_min_extractions";
     public static final String ENABLE_PARQUET_READER_BLOOM_FILTER = "enable_parquet_reader_bloom_filter";
     public static final String ENABLE_PARQUET_READER_PAGE_INDEX = "enable_parquet_reader_page_index";
 
@@ -1331,6 +1433,18 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     @VariableMgr.VarAttr(name = ENABLE_LAKE_TABLET_INTERNAL_PARALLEL)
     private boolean enableLakeTabletInternalParallel = true;
 
+    // A lake tablet whose row count exceeds this ratio times the per-driver ideal share is treated as a
+    // skewed straggler and split under the prepared-physical-split scan even when the scan-range count
+    // already reaches pipeline_dop. Only affects enable_lake_prepared_physical_split_scan.
+    @VariableMgr.VarAttr(name = LAKE_TABLET_INTERNAL_PARALLEL_SKEW_SPLIT_RATIO)
+    private double lakeTabletInternalParallelSkewSplitRatio = 1.5;
+
+    // When false (default), a lake table scanned by >=2 scan operators in the same query (self-join /
+    // multi-scan) does NOT use the prepared-physical-split scan: its per-scan reuse of a shared prepared
+    // read state is unsafe across sibling scans of the same table. Set true to opt such scans back in.
+    @VariableMgr.VarAttr(name = ENABLE_LAKE_PREPARED_SPLIT_ON_DUP_TABLE_SCAN)
+    private boolean enableLakePreparedSplitOnDupTableScan = false;
+
     // The strategy mode of TabletInternalParallel, which is effective only when enableTabletInternalParallel is true.
     // The optional values are "auto" and "force_split".
     @VariableMgr.VarAttr(name = TABLET_INTERNAL_PARALLEL_MODE, flag = VariableMgr.INVISIBLE)
@@ -1348,6 +1462,15 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     @VariableMgr.VarAttr(name = LOAD_MEM_LIMIT)
     private long loadMemLimit = 0L;
+
+    @VariableMgr.VarAttr(name = LAKE_MULTI_NODE_TABLET_WRITE_MODE)
+    private String lakeMultiNodeTabletWriteMode = "auto";
+
+    @VariableMgr.VarAttr(name = LAKE_MULTI_NODE_WRITE_MAX_NODES)
+    private int lakeMultiNodeWriteMaxNodes = 6;
+
+    @VariableMgr.VarAttr(name = LAKE_MULTI_NODE_WRITE_BYTES_PER_NODE)
+    private long lakeMultiNodeWriteBytesPerNode = 2147483648L;
 
     @VariableMgr.VarAttr(name = QUERY_MEM_LIMIT)
     private long queryMemLimit = 0L;
@@ -1634,6 +1757,11 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     // Deprecated: Use connector_sink_shuffle_mode instead
     @VariableMgr.VarAttr(name = ENABLE_ICEBERG_SINK_GLOBAL_SHUFFLE, flag = VariableMgr.INVISIBLE)
     private boolean enableIcebergSinkGlobalShuffle = false;
+
+    // Lake prepared physical split scan: seed prunes each segment once and shares the prepared read state
+    // across split children. Default off; a per-scan decision in PlanFragmentBuilder gates it further.
+    @VariableMgr.VarAttr(name = ENABLE_LAKE_PREPARED_PHYSICAL_SPLIT_SCAN)
+    private boolean enableLakePreparedPhysicalSplitScan = false;
 
     @VariableMgr.VarAttr(name = CONNECTOR_SINK_SHUFFLE_MODE)
     private String connectorSinkShuffleMode = ConnectorSinkShuffleMode.AUTO.modeName();
@@ -2105,6 +2233,17 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     @VarAttr(name = STATISTIC_COLLECT_PARALLEL, flag = VariableMgr.INVISIBLE)
     private int statisticCollectParallelism = 1;
 
+    // Bounded-cost external-table statistics-scan budgets (see design 2.4). <= 0 means the dimension is
+    // unlimited; all three <= 0 disables early stop, so a plain query never inherits a budget by accident.
+    @VarAttr(name = EXTERNAL_STATS_SCAN_BYTES_CAP, flag = VariableMgr.INVISIBLE)
+    private long externalStatsScanBytesCap = -1;
+
+    @VarAttr(name = EXTERNAL_STATS_SCAN_FILES_CAP, flag = VariableMgr.INVISIBLE)
+    private long externalStatsScanFilesCap = -1;
+
+    @VarAttr(name = EXTERNAL_STATS_SCAN_ROWS_CAP, flag = VariableMgr.INVISIBLE)
+    private long externalStatsScanRowsCap = -1;
+
     @VarAttr(name = STATISTIC_META_COLLECT_PARALLEL, flag = VariableMgr.INVISIBLE)
     private int statisticMetaCollectParallelism = 10;
 
@@ -2127,6 +2266,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     @VarAttr(name = CBO_PUSH_DOWN_AGGREGATE_ON_BROADCAST_JOIN_ROW_COUNT_LIMIT, flag = VariableMgr.INVISIBLE)
     private long cboPushDownAggregateOnBroadcastJoinRowCountLimit = 250000;
+
+    @VarAttr(name = CBO_PUSH_DOWN_COUNT_AGGREGATE, flag = VariableMgr.INVISIBLE)
+    private boolean cboPushDownCountAggregate = true;
 
     @VarAttr(name = CBO_ENABLE_INTERSECT_ADD_DISTINCT)
     private boolean cboEnableIntersectAddDistinct = true;
@@ -2242,6 +2384,13 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     @VarAttr(name = CBO_PUSHDOWN_TOPN_LIMIT)
     private long cboPushDownTopNLimit = 1000;
 
+    @VarAttr(name = ENABLE_AI_TOPN_PUSHDOWN, flag = VariableMgr.INVISIBLE)
+    private boolean enableAiTopnPushdown = true;
+
+    // Larger limits use per-instance candidates; zero selects the local path for all eligible limits.
+    @VarAttr(name = AI_TOPN_PUSHDOWN_MAX_GLOBAL_LIMIT)
+    private long aiTopnPushdownMaxGlobalLimit = 1000;
+
     @VarAttr(name = CBO_PUSHDOWN_DISTINCT_LIMIT)
     private long cboPushDownDistinctLimit = 4096;
 
@@ -2277,6 +2426,14 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     @VarAttr(name = ENABLE_PREDICATE_EXPR_REUSE, flag = VariableMgr.INVISIBLE)
     private boolean enablePredicateExprReuse = true;
+
+    // Parse a VARCHAR document once when several get_json_xxx calls in one projection read it.
+    @VarAttr(name = ENABLE_SHARE_JSON_PARSE, flag = VariableMgr.INVISIBLE)
+    private boolean enableShareJsonParse = true;
+
+    // Minimum number of distinct get_json_xxx calls on one VARCHAR document before its parse is shared.
+    @VarAttr(name = SHARE_JSON_PARSE_MIN_EXTRACTIONS, flag = VariableMgr.INVISIBLE)
+    private int shareJsonParseMinExtractions = 2;
 
     @VarAttr(name = TOPN_FILTER_BACK_PRESSURE_MODE)
     private int topnFilterBackPressureMode = 0;
@@ -2440,6 +2597,14 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
         return enableSplitTopNAgg;
     }
 
+    public boolean isEnableLakePreparedPhysicalSplitScan() {
+        return enableLakePreparedPhysicalSplitScan;
+    }
+
+    public void setEnableLakePreparedPhysicalSplitScan(boolean enableLakePreparedPhysicalSplitScan) {
+        this.enableLakePreparedPhysicalSplitScan = enableLakePreparedPhysicalSplitScan;
+    }
+
     public long getSplitTopNAggLimit() {
         return splitTopNAggLimit;
     }
@@ -2562,6 +2727,27 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public long getCboPushDownTopNLimit() {
         return cboPushDownTopNLimit;
+    }
+
+    public boolean isEnableAiTopnPushdown() {
+        return enableAiTopnPushdown;
+    }
+
+    public void setEnableAiTopnPushdown(boolean enableAiTopnPushdown) {
+        this.enableAiTopnPushdown = enableAiTopnPushdown;
+    }
+
+    public long getAiTopnPushdownMaxGlobalLimit() {
+        return aiTopnPushdownMaxGlobalLimit;
+    }
+
+    public void setAiTopnPushdownMaxGlobalLimit(long aiTopnPushdownMaxGlobalLimit) {
+        // SET_VAR hints reach this setter without going through SetStmtAnalyzer.
+        if (aiTopnPushdownMaxGlobalLimit < 0) {
+            ErrorReport.reportSemanticException(ErrorCode.ERR_INVALID_VALUE,
+                    AI_TOPN_PUSHDOWN_MAX_GLOBAL_LIMIT, aiTopnPushdownMaxGlobalLimit, "a non-negative integer");
+        }
+        this.aiTopnPushdownMaxGlobalLimit = aiTopnPushdownMaxGlobalLimit;
     }
 
     public long cboPushDownDistinctLimit() {
@@ -2845,6 +3031,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     @VariableMgr.VarAttr(name = PAIMON_FORCE_JNI_READER)
     private boolean paimonForceJNIReader = false;
 
+    @VariableMgr.VarAttr(name = PAIMON_READER_MODE)
+    private String paimonReaderMode = PaimonReaderMode.AUTO.name();
+
     @VariableMgr.VarAttr(name = AVRO_USE_JNI_READER)
     private boolean avroUseJNIReader = false;
 
@@ -3061,6 +3250,12 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     @VariableMgr.VarAttr(name = GROUP_CONCAT_MAX_LEN)
     private long groupConcatMaxLen = 1024;
 
+    // Maximum number of elements in an array produced by an array function. A query that exceeds it
+    // fails instead of returning an oversized array. 0 or negative means unlimited. This is meant to
+    // cover every array-producing function, but only array_agg enforces it so far.
+    @VariableMgr.VarAttr(name = MAX_ARRAY_LENGTH)
+    private long maxArrayLength = 0;
+
     @VariableMgr.VarAttr(name = FULL_SORT_MAX_BUFFERED_ROWS, flag = VariableMgr.INVISIBLE)
     private long fullSortMaxBufferedRows = 1 * 1024 * 1024 * 1024;
 
@@ -3086,6 +3281,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     @VariableMgr.VarAttr(name = ENABLE_SPLIT_WINDOW_SKEW_TO_UNION)
     private boolean enableSplitWindowSkewToUnion = false;
 
+    @VariableMgr.VarAttr(name = ENABLE_WINDOW_SKEW_MERGE_SORT, flag = VariableMgr.INVISIBLE)
+    private boolean enableWindowSkewMergeSort = false;
+
     @VariableMgr.VarAttr(name = HDFS_BACKEND_SELECTOR_SCAN_RANGE_SHUFFLE, flag = VariableMgr.INVISIBLE)
     private boolean hdfsBackendSelectorScanRangeShuffle = false;
 
@@ -3103,6 +3301,14 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     @VarAttr(name = SCAN_OR_TO_UNION_THRESHOLD, flag = VariableMgr.INVISIBLE)
     private long scanOrToUnionThreshold = 50000000;
+
+    // Disable the one-tablet optimization (one-phase aggregation / single-tablet gather output) when the
+    // single selected tablet's fuzzy row count exceeds this value; such a large tablet would otherwise be
+    // scanned and aggregated serially on one node. Default 10000000 (10M rows) enables the gate for
+    // genuinely large tablets while sparing small/medium ones; set to -1 to disable the gate entirely and
+    // keep the pre-existing one-tablet behavior regardless of tablet size.
+    @VarAttr(name = ONE_TABLET_OPT_MAX_TABLET_ROWS)
+    private long oneTabletOptMaxTabletRows = 10000000;
 
     @VarAttr(name = ENABLE_PUSHDOWN_OR_PREDICATE, flag = VariableMgr.INVISIBLE)
     private boolean enablePushdownOrPredicate = true;
@@ -3251,6 +3457,18 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
         this.annParams = annParams;
     }
 
+    public double getKFactor() {
+        return kFactor;
+    }
+
+    public void setKFactor(double kFactor) {
+        this.kFactor = kFactor;
+    }
+
+    public double getPqRefineFactor() {
+        return pqRefineFactor;
+    }
+
     public Map<String, String> getAnnParams() {
         if (Strings.isNullOrEmpty(annParams)) {
             return Maps.newHashMap();
@@ -3278,6 +3496,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     @VarAttr(name = ENABLE_READ_ICEBERG_PUFFIN_NDV)
     private boolean enableReadIcebergPuffinNdv = true;
+
+    @VarAttr(name = ENABLE_ICEBERG_V3_DELETION_VECTOR)
+    private boolean enableIcebergV3DeletionVector = true;
 
     @VarAttr(name = ENABLE_ICEBERG_COLUMN_STATISTICS)
     private boolean enableIcebergColumnStatistics = false;
@@ -3433,6 +3654,14 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public void setEnableReadIcebergPuffinNdv(boolean enableReadIcebergPuffinNdv) {
         this.enableReadIcebergPuffinNdv = enableReadIcebergPuffinNdv;
+    }
+
+    public boolean enableIcebergV3DeletionVector() {
+        return enableIcebergV3DeletionVector;
+    }
+
+    public void setEnableIcebergV3DeletionVector(boolean enableIcebergV3DeletionVector) {
+        this.enableIcebergV3DeletionVector = enableIcebergV3DeletionVector;
     }
 
     public boolean enableDeltaLakeColumnStatistics() {
@@ -3619,6 +3848,14 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
         this.exprChildrenLimit = exprChildrenLimit;
     }
 
+    public long getMaxArrayLength() {
+        return maxArrayLength;
+    }
+
+    public void setMaxArrayLength(long maxArrayLength) {
+        this.maxArrayLength = maxArrayLength;
+    }
+
     public void setFullSortMaxBufferedRows(long v) {
         fullSortMaxBufferedRows = v;
     }
@@ -3699,12 +3936,35 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
         this.enableSplitWindowSkewToUnion = enableSplitWindowSkewToUnion;
     }
 
+    public boolean isEnableWindowSkewMergeSort() {
+        return enableWindowSkewMergeSort;
+    }
+
+    public void setEnableWindowSkewMergeSort(boolean enableWindowSkewMergeSort) {
+        this.enableWindowSkewMergeSort = enableWindowSkewMergeSort;
+    }
+
     public boolean getHudiMORForceJNIReader() {
         return hudiMORForceJNIReader;
     }
 
     public boolean getPaimonForceJNIReader() {
         return paimonForceJNIReader;
+    }
+
+    public PaimonReaderMode getPaimonReaderMode() {
+        // The SET path is validated by PaimonReaderModeConverter, but the raw string can also be
+        // written through non-validated paths (e.g. the reflective setter), so parse defensively
+        // instead of throwing IllegalArgumentException at plan time.
+        try {
+            return PaimonReaderMode.valueOf(paimonReaderMode.toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            return PaimonReaderMode.AUTO;
+        }
+    }
+
+    public void setPaimonReaderMode(String paimonReaderMode) {
+        this.paimonReaderMode = paimonReaderMode.toUpperCase(Locale.ROOT);
     }
 
     public boolean getAvroUseJNIReader() {
@@ -3881,6 +4141,30 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
         this.statisticCollectParallelism = parallelism;
     }
 
+    public long getExternalStatsScanBytesCap() {
+        return externalStatsScanBytesCap;
+    }
+
+    public void setExternalStatsScanBytesCap(long externalStatsScanBytesCap) {
+        this.externalStatsScanBytesCap = externalStatsScanBytesCap;
+    }
+
+    public long getExternalStatsScanFilesCap() {
+        return externalStatsScanFilesCap;
+    }
+
+    public void setExternalStatsScanFilesCap(long externalStatsScanFilesCap) {
+        this.externalStatsScanFilesCap = externalStatsScanFilesCap;
+    }
+
+    public long getExternalStatsScanRowsCap() {
+        return externalStatsScanRowsCap;
+    }
+
+    public void setExternalStatsScanRowsCap(long externalStatsScanRowsCap) {
+        this.externalStatsScanRowsCap = externalStatsScanRowsCap;
+    }
+
     public int getStatisticMetaCollectParallelism() {
         return statisticMetaCollectParallelism;
     }
@@ -3968,6 +4252,50 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public long getLoadMemLimit() {
         return loadMemLimit;
+    }
+
+    public String getLakeMultiNodeTabletWriteMode() {
+        return lakeMultiNodeTabletWriteMode;
+    }
+
+    // Named for the field so VariableMgr's SETTER_MAP picks it up: a bad mode must fail the SET
+    // rather than be stored and quietly read as something else later.
+    public void setLakeMultiNodeTabletWriteMode(String mode) {
+        this.lakeMultiNodeTabletWriteMode = parseMultiNodeTabletWriteMode(mode).name().toLowerCase();
+    }
+
+    public MultiNodeTabletWriteMode getMultiNodeTabletWriteMode() {
+        return parseMultiNodeTabletWriteMode(lakeMultiNodeTabletWriteMode);
+    }
+
+    // Public so a load that planned its sink from a persisted snapshot of this variable resolves the
+    // mode exactly as a SET does, rejection included.
+    public static MultiNodeTabletWriteMode parseMultiNodeTabletWriteMode(String mode) {
+        if (mode != null) {
+            for (MultiNodeTabletWriteMode candidate : MultiNodeTabletWriteMode.values()) {
+                if (candidate.name().equalsIgnoreCase(mode.trim())) {
+                    return candidate;
+                }
+            }
+        }
+        throw new SemanticException("Invalid " + LAKE_MULTI_NODE_TABLET_WRITE_MODE + ": '" + mode
+                + "'. Valid values are off, auto, force.");
+    }
+
+    public int getLakeMultiNodeWriteMaxNodes() {
+        return lakeMultiNodeWriteMaxNodes;
+    }
+
+    public void setLakeMultiNodeWriteMaxNodes(int lakeMultiNodeWriteMaxNodes) {
+        this.lakeMultiNodeWriteMaxNodes = lakeMultiNodeWriteMaxNodes;
+    }
+
+    public long getLakeMultiNodeWriteBytesPerNode() {
+        return lakeMultiNodeWriteBytesPerNode;
+    }
+
+    public void setLakeMultiNodeWriteBytesPerNode(long lakeMultiNodeWriteBytesPerNode) {
+        this.lakeMultiNodeWriteBytesPerNode = lakeMultiNodeWriteBytesPerNode;
     }
 
     public int getQueryTimeoutS() {
@@ -4747,6 +5075,29 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
         return enableTabletInternalParallel || (RunMode.isSharedDataMode() && enableLakeTabletInternalParallel);
     }
 
+    public double getLakeTabletInternalParallelSkewSplitRatio() {
+        return lakeTabletInternalParallelSkewSplitRatio;
+    }
+
+    public boolean isEnableLakePreparedSplitOnDupTableScan() {
+        return enableLakePreparedSplitOnDupTableScan;
+    }
+
+    public void setEnableLakePreparedSplitOnDupTableScan(boolean enableLakePreparedSplitOnDupTableScan) {
+        this.enableLakePreparedSplitOnDupTableScan = enableLakePreparedSplitOnDupTableScan;
+    }
+
+    public void setLakeTabletInternalParallelSkewSplitRatio(double ratio) {
+        // The BE multiplies the per-driver ideal share by this ratio to decide has_skewed_big_tablet;
+        // a non-positive value would flag every sufficiently large tablet as skewed (over-splitting),
+        // while NaN/Infinity would silently disable the skew override. Require a positive finite number.
+        if (!Double.isFinite(ratio) || ratio <= 0) {
+            ErrorReport.reportSemanticException(ErrorCode.ERR_INVALID_VALUE,
+                    LAKE_TABLET_INTERNAL_PARALLEL_SKEW_SPLIT_RATIO, ratio, "a positive finite number");
+        }
+        this.lakeTabletInternalParallelSkewSplitRatio = ratio;
+    }
+
     public boolean isEnableResourceGroup() {
         return true;
     }
@@ -4816,10 +5167,16 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
         return this.maxPipelineDop;
     }
 
-    // TODO(murphy) support this variable
-    // It's always false since version 3.5, due to incompatibility with event-based scheduling
+    // Shared scan was hard-disabled in 3.5 (#63543) because the shared round-robin chunk
+    // buffer could drop driver wakeups under event-based scheduling: a chunk produced by one
+    // scan driver lands in a sibling driver's buffer slot, but only the producer's own
+    // observer was notified, so the slot owner could hang. The BE scan operators now notify
+    // all sibling drivers whenever shared scan is active (see {Olap,Connector}ScanOperator::
+    // need_notify_all), making shared scan compatible with event scheduling again. Honor the
+    // session variable. (Query cache still forces shared scan off in the BE; see
+    // fragment_executor.cpp.)
     public boolean isEnableSharedScan() {
-        return false;
+        return enableSharedScan;
     }
 
     public int getResourceGroupId() {
@@ -5123,6 +5480,14 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public void setCboPushDownAggregateOnBroadcastJoinRowCountLimit(long cboPushDownAggregateOnBroadcastJoinRowCountLimit) {
         this.cboPushDownAggregateOnBroadcastJoinRowCountLimit = cboPushDownAggregateOnBroadcastJoinRowCountLimit;
+    }
+
+    public boolean isCboPushDownCountAggregate() {
+        return cboPushDownCountAggregate;
+    }
+
+    public void setCboPushDownCountAggregate(boolean cboPushDownCountAggregate) {
+        this.cboPushDownCountAggregate = cboPushDownCountAggregate;
     }
 
     public String getCboPushDownAggregate() {
@@ -5720,6 +6085,14 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
         this.scanOrToUnionThreshold = scanOrToUnionThreshold;
     }
 
+    public long getOneTabletOptMaxTabletRows() {
+        return oneTabletOptMaxTabletRows;
+    }
+
+    public void setOneTabletOptMaxTabletRows(long oneTabletOptMaxTabletRows) {
+        this.oneTabletOptMaxTabletRows = oneTabletOptMaxTabletRows;
+    }
+
     public TPredicateTreeParams getPredicateTreeParams() {
         TPredicateTreeParams params = new TPredicateTreeParams();
         params.setEnable_or(enablePushdownOrPredicate);
@@ -6129,6 +6502,22 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public boolean isEnablePredicateExprReuse() {
         return enablePredicateExprReuse;
+    }
+
+    public void setEnableShareJsonParse(boolean enableShareJsonParse) {
+        this.enableShareJsonParse = enableShareJsonParse;
+    }
+
+    public boolean isEnableShareJsonParse() {
+        return enableShareJsonParse;
+    }
+
+    public void setShareJsonParseMinExtractions(int shareJsonParseMinExtractions) {
+        this.shareJsonParseMinExtractions = shareJsonParseMinExtractions;
+    }
+
+    public int getShareJsonParseMinExtractions() {
+        return shareJsonParseMinExtractions;
     }
 
     public int getConnectorIncrementalScanRangeNumber() {
@@ -6544,6 +6933,7 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
         tResult.setTransmission_encode_level(transmissionEncodeLevel);
         tResult.setGroup_concat_max_len(groupConcatMaxLen);
+        tResult.setMax_array_length(maxArrayLength);
         tResult.setRpc_http_min_size(rpcHttpMinSize);
         tResult.setInterleaving_group_size(interleavingGroupSize);
         tResult.setEnable_predicate_col_late_materialize(enablePredicateColLateMaterialize);
@@ -6589,6 +6979,7 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
         } else {
             tResult.setEnable_tablet_internal_parallel(enableTabletInternalParallel);
         }
+        tResult.setLake_tablet_internal_parallel_skew_split_ratio(lakeTabletInternalParallelSkewSplitRatio);
 
         tResult.setTablet_internal_parallel_mode(
                 TTabletInternalParallelMode.valueOf(tabletInternalParallelMode.toUpperCase()));

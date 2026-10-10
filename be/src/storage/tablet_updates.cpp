@@ -1466,7 +1466,7 @@ Status TabletUpdates::_apply_normal_rowset_commit(const EditVersionInfo& version
     int64_t full_rowset_size = 0;
     if (rowset->rowset_meta()->get_meta_pb_without_schema().delfile_idxes_size() == 0) {
         for (uint32_t i = 0; i < rowset->num_segments(); i++) {
-            st = state.load_upserts(rowset.get(), i);
+            st = state.load_upserts(i);
             if (!st.ok()) {
                 std::string msg = strings::Substitute("_apply_rowset_commit error: load upserts failed: $0 $1",
                                                       st.to_string(), debug_string());
@@ -1514,7 +1514,7 @@ Status TabletUpdates::_apply_normal_rowset_commit(const EditVersionInfo& version
         // 1. upgrade from old version. delfile_idxes in rowset meta is empty, we still need to load delete files
         // 2. pure upsert. no delete files, the following logic will be skip
         for (uint32_t i = 0; i < rowset->num_delete_files(); i++) {
-            st = state.load_deletes(rowset.get(), i);
+            st = state.load_deletes(i);
             if (!st.ok()) {
                 std::string msg = strings::Substitute("_apply_rowset_commit error: load deletes failed: $0 $1",
                                                       st.to_string(), debug_string());
@@ -1546,7 +1546,7 @@ Status TabletUpdates::_apply_normal_rowset_commit(const EditVersionInfo& version
                 del_idx = rowset->rowset_meta()->get_meta_pb_without_schema().delfile_idxes(loaded_delfile);
             }
             while (i < del_idx) {
-                st = state.load_upserts(rowset.get(), loaded_upsert);
+                st = state.load_upserts(loaded_upsert);
                 FAIL_POINT_TRIGGER_EXECUTE(tablet_apply_load_upserts_failed,
                                            { st = Status::InternalError("inject tablet_apply_load_upserts_failed"); });
                 if (!st.ok()) {
@@ -1602,7 +1602,7 @@ Status TabletUpdates::_apply_normal_rowset_commit(const EditVersionInfo& version
             }
             if (loaded_delfile < delfile_num) {
                 DCHECK(i == del_idx);
-                st = state.load_deletes(rowset.get(), loaded_delfile);
+                st = state.load_deletes(loaded_delfile);
                 FAIL_POINT_TRIGGER_EXECUTE(tablet_apply_load_deletes_failed,
                                            { st = Status::InternalError("inject tablet_apply_load_deletes_failed"); });
                 if (!st.ok()) {
@@ -1768,14 +1768,19 @@ Status TabletUpdates::_apply_normal_rowset_commit(const EditVersionInfo& version
                 }
                 rowset->rowset_meta()->set_total_row_size(full_row_size);
                 const auto index_disk_size = rowset->rowset_meta()->index_disk_size();
-                // full_rowset_size is the segment file bytes (column data + embedded indexes).
-                // index_disk_size tracks additional index bytes recorded in RowsetMeta; these may
-                // be separately persisted (e.g. primary-key SSTable indexes) or otherwise accounted
-                // for outside the segment file.
-                // Canonical invariant: data_disk_size = segment_size - index_size,
-                //                      total_disk_size = segment_size (== data + index).
-                rowset->rowset_meta()->set_data_disk_size(std::max<int64_t>(0, full_rowset_size - index_disk_size));
-                rowset->rowset_meta()->set_total_disk_size(full_rowset_size);
+                // full_rowset_size is the segment (.dat) file bytes: column data + embedded indexes.
+                // index_disk_size counts all index bytes, including standalone index files (the
+                // vector index .vi) that live outside the segment files. Subtracting the full
+                // index_disk_size from the segment-file size would remove the standalone bytes that
+                // were never part of full_rowset_size and drive data_disk_size to zero for
+                // vector-index rowsets, so subtract only the embedded portion.
+                const auto standalone_index_size = rowset->rowset_meta()->standalone_index_size();
+                const auto embedded_index_size =
+                        index_disk_size - std::min<int64_t>(standalone_index_size, index_disk_size);
+                // Invariant: data_disk_size = segment_size - embedded_index_size,
+                //            total_disk_size = segment_size + standalone_index_size (== data + index).
+                rowset->rowset_meta()->set_data_disk_size(std::max<int64_t>(0, full_rowset_size - embedded_index_size));
+                rowset->rowset_meta()->set_total_disk_size(full_rowset_size + standalone_index_size);
                 rowset->set_schema(apply_tschema);
                 rowset->rowset_meta()->set_tablet_schema(apply_tschema);
                 (void)rowset->reload();
@@ -3529,7 +3534,7 @@ void TabletUpdates::get_compaction_status(std::string* json_result) {
 
     rapidjson::Document rowset_details;
     rowset_details.SetArray();
-    for (int i = 0; i < rowset_ids.size(); ++i) {
+    for (size_t i = 0; i < rowsets.size(); ++i) {
         rapidjson::Value value;
         value.SetObject();
 
@@ -3552,21 +3557,21 @@ void TabletUpdates::get_compaction_status(std::string* json_result) {
 
     rapidjson::Document apply_rowset_details;
     apply_rowset_details.SetArray();
-    for (int i = 0; i < apply_version_rowset_ids.size(); ++i) {
+    for (size_t i = 0; i < apply_version_rowsets.size(); ++i) {
         rapidjson::Value value;
         value.SetObject();
 
         rapidjson::Value rowset_id;
-        std::string rowset_id_value = rowsets[i]->rowset_id().to_string();
+        std::string rowset_id_value = apply_version_rowsets[i]->rowset_id().to_string();
         rowset_id.SetString(rowset_id_value.c_str(), rowset_id_value.length(), root.GetAllocator());
         value.AddMember("rowset_id", rowset_id, root.GetAllocator());
 
         rapidjson::Value num_segments;
-        num_segments.SetInt64(rowsets[i]->num_segments());
+        num_segments.SetInt64(apply_version_rowsets[i]->num_segments());
         value.AddMember("num_segments", num_segments, root.GetAllocator());
 
         rapidjson::Value rowset_size;
-        rowset_size.SetInt64(rowsets[i]->data_disk_size());
+        rowset_size.SetInt64(apply_version_rowsets[i]->data_disk_size());
         value.AddMember("rowset_size", rowset_size, root.GetAllocator());
 
         apply_rowset_details.PushBack(value, apply_rowset_details.GetAllocator());
@@ -3847,6 +3852,10 @@ void TabletUpdates::_print_rowsets(std::vector<uint32_t>& rowsets, std::string* 
 
 void TabletUpdates::_set_error(const string& msg) {
     StorageMetrics::instance()->primary_key_table_error_state_total.increment(1);
+    _mark_unusable(msg);
+}
+
+void TabletUpdates::_mark_unusable(const string& msg) {
     _error_msg = msg;
     _error = true;
     _apply_version_changed.notify_all();
@@ -5213,7 +5222,9 @@ Status TabletUpdates::clear_meta() {
     auto data_store = _tablet.data_dir();
     auto meta_store = data_store->get_meta();
 
-    _set_error("clear_meta inprogress"); // Mark this tablet unusable first.
+    // This is an expected part of dropping a tablet, not a storage error. Keep the tablet unusable while its
+    // metadata is being cleared without incrementing primary_key_table_error_state_total.
+    _mark_unusable("clear_meta inprogress");
 
     // Clear permanently stored meta.
     RETURN_IF_ERROR(TabletMetaManager::clear_pending_rowset(data_store, &wb, _tablet.tablet_id()));

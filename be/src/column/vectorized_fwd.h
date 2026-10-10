@@ -92,7 +92,6 @@ using Decimal64Column = DecimalV3Column<int64_t>;
 using Decimal128Column = DecimalV3Column<int128_t>;
 using Decimal256Column = DecimalV3Column<int256_t>;
 using BinaryColumn = BinaryColumnBase<uint32_t>;
-using LargeBinaryColumn = BinaryColumnBase<uint64_t>;
 
 class ColumnVisitor;
 class ColumnVisitorMutable;
@@ -116,6 +115,8 @@ class JsonColumn;
 using VariantColumnBase = ObjectColumn<VariantRowValue>;
 class VariantColumn;
 
+class FileColumn;
+
 class MapColumn;
 class StructColumn;
 
@@ -124,13 +125,6 @@ class ColumnView;
 using ChunkPtr = std::shared_ptr<Chunk>;
 using ChunkUniquePtr = std::unique_ptr<Chunk>;
 using Chunks = std::vector<ChunkPtr>;
-
-class SegmentedColumn;
-class SegmentedChunk;
-using SegmentedColumnPtr = std::shared_ptr<SegmentedColumn>;
-using SegmentedColumns = std::vector<SegmentedColumnPtr>;
-using SegmentedChunkPtr = std::shared_ptr<SegmentedChunk>;
-using SegmentedChunkWeakPtr = std::weak_ptr<SegmentedChunk>;
 
 using SchemaPtr = std::shared_ptr<Schema>;
 

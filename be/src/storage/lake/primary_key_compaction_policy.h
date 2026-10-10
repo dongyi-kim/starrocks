@@ -120,14 +120,24 @@ struct PKSizeTieredLevel {
 class PrimaryCompactionPolicy : public CompactionPolicy {
 public:
     explicit PrimaryCompactionPolicy(TabletManager* tablet_mgr, std::shared_ptr<const TabletMetadataPB> tablet_metadata,
-                                     bool force_base_compaction)
-            : CompactionPolicy(tablet_mgr, std::move(tablet_metadata), force_base_compaction) {}
+                                     bool force_base_compaction, bool allow_base_compaction = true)
+            : CompactionPolicy(tablet_mgr, std::move(tablet_metadata), force_base_compaction, allow_base_compaction) {}
 
     ~PrimaryCompactionPolicy() override = default;
 
     StatusOr<std::vector<RowsetPtr>> pick_rowsets() override;
     StatusOr<std::vector<RowsetPtr>> pick_rowsets(const std::shared_ptr<const TabletMetadataPB>& tablet_metadata,
                                                   std::vector<bool>* has_dels);
+
+    // Base compaction: a full merge of the tablet's rowsets (like non-primary-key base compaction),
+    // ordered by absolute delete-row count (num_dels) descending so that, when the result-bytes
+    // budget forces a subset, the rowsets holding the most delete marks are rewritten first. This
+    // drops deleted rows and shrinks the delete vectors. Used when a manual ALTER TABLE ... COMPACT
+    // forces a base compaction, or when the tablet has accumulated enough deletes to warrant
+    // reclamation (by delete ratio or absolute delete-row count). When has_dels is non-null it is
+    // filled, in returned-rowset order, with whether each picked rowset carries deletes.
+    StatusOr<std::vector<RowsetPtr>> pick_base_rowsets(const std::shared_ptr<const TabletMetadataPB>& tablet_metadata,
+                                                       std::vector<bool>* has_dels = nullptr);
 
     // Common function to return the picked rowset indexes.
     // For compaction score, only picked rowset indexes are needed.
@@ -140,6 +150,20 @@ public:
 
 private:
     int64_t _get_data_size(const std::shared_ptr<const TabletMetadataPB>& tablet_metadata);
+};
+
+// One-shot policy used after a range-tablet split. A rowset is the metadata and
+// conflict-resolution unit, so a rowset containing any shared segment must be
+// rewritten in full. This deliberately bypasses every normal score, size and
+// input-count gate. Rowset readers apply the child tablet range only to shared
+// segments; private segments in a mixed rowset are already child-local.
+class UnshareCompactionPolicy final : public CompactionPolicy {
+public:
+    explicit UnshareCompactionPolicy(TabletManager* tablet_mgr, std::shared_ptr<const TabletMetadataPB> tablet_metadata)
+            : CompactionPolicy(tablet_mgr, std::move(tablet_metadata), false) {}
+
+    StatusOr<std::vector<RowsetPtr>> pick_rowsets() override;
+    StatusOr<CompactionAlgorithm> choose_compaction_algorithm(const std::vector<RowsetPtr>& rowsets) override;
 };
 
 } // namespace starrocks::lake

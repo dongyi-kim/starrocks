@@ -126,6 +126,8 @@ public class CreateFunctionAnalyzer {
             }
             slotRef.setType(argsMap.get(slotRef.getColName()));
         });
+        AIFunctionUsageAnalyzer.verifyNoAIFunctions(
+                expr, AIFunctionUsageAnalyzer.PlacementContext.SQL_UDF_BODY);
 
         FunctionName functionName = FunctionRefAnalyzer.resolveFunctionName(
                 stmt.getFunctionRef(),
@@ -1160,6 +1162,7 @@ public class CreateFunctionAnalyzer {
         String symbol = properties.get(CreateFunctionStmt.SYMBOL_KEY);
         String inputType = properties.getOrDefault(CreateFunctionStmt.INPUT_TYPE, "scalar");
         String objectFile = properties.getOrDefault(CreateFunctionStmt.FILE_KEY, "inline");
+        String serviceUrl = properties.get(CreateFunctionStmt.SERVICE_URL_KEY);
 
         if (isInline && !StringUtils.equalsIgnoreCase(objectFile, "inline")) {
             ErrorReport.reportSemanticException(ErrorCode.ERR_COMMON_ERROR, "inline function file should be 'inline'");
@@ -1186,7 +1189,8 @@ public class CreateFunctionAnalyzer {
                 inputType(inputType).
                 symbolName(symbol).
                 isolation(!CreateFunctionStmt.ISOLATION_SHARED.equalsIgnoreCase(isolation)).
-                content(content);
+                content(content).
+                serviceUrl(serviceUrl);
         ScalarFunction function = scalarFunctionBuilder.build();
         function.setChecksum(checksum);
         stmt.setFunction(function);

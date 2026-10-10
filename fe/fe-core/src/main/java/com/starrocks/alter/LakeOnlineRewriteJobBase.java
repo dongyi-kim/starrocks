@@ -20,23 +20,30 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.gson.annotations.SerializedName;
+import com.starrocks.alter.reshard.presplit.Estimates;
+import com.starrocks.alter.reshard.presplit.TabletPreSplitCoordinator;
 import com.starrocks.authorization.PrivilegeBuiltinConstants;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
+import com.starrocks.catalog.MaterializedIndexMeta;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.PhysicalPartition;
+import com.starrocks.catalog.SchemaInfo;
 import com.starrocks.catalog.Tablet;
 import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.catalog.TabletMeta;
 import com.starrocks.catalog.Tuple;
 import com.starrocks.catalog.UserIdentity;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.common.Config;
+import com.starrocks.common.ErrorReportException;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.util.ParseUtil;
 import com.starrocks.common.util.TimeUtils;
 import com.starrocks.common.util.UUIDUtil;
+import com.starrocks.common.util.concurrent.MarkedCountDownLatch;
 import com.starrocks.common.util.concurrent.lock.AutoCloseableLock;
 import com.starrocks.common.util.concurrent.lock.LockType;
 import com.starrocks.lake.Utils;
@@ -50,13 +57,23 @@ import com.starrocks.qe.QueryState;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.qe.StmtExecutor;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.sql.ast.DmlStmt;
 import com.starrocks.sql.ast.InsertStmt;
+import com.starrocks.sql.ast.KeysType;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.parser.SqlParser;
+import com.starrocks.system.ComputeNode;
+import com.starrocks.task.AgentBatchTask;
+import com.starrocks.task.CreateReplicaTask;
 import com.starrocks.thrift.TStorageMedium;
+import com.starrocks.thrift.TStorageType;
+import com.starrocks.thrift.TTabletSchema;
+import com.starrocks.thrift.TTabletType;
+import com.starrocks.transaction.InsertTxnCommitAttachment;
 import com.starrocks.transaction.TransactionState;
 import com.starrocks.transaction.TransactionStatus;
+import com.starrocks.transaction.TxnCommitAttachment;
 import com.starrocks.warehouse.Warehouse;
 import io.opentelemetry.api.trace.StatusCode;
 import org.apache.logging.log4j.LogManager;
@@ -109,6 +126,38 @@ public abstract class LakeOnlineRewriteJobBase
     // stable for the job's lifetime. Not serialized; re-resolved after replay on first tick.
     private transient String cachedDbName;
 
+    // Transient: how much wall-clock time each physical partition's own retry episode has already
+    // consumed - summed, over its consecutive failed attempts, as how long the attempt ran plus the one
+    // scheduler gap its retry costs. A successful attempt, or the partition publishing, drops the entry.
+    //
+    // Charged per ATTEMPT rather than measured as time elapsed since the first failure, and all three
+    // parts of that are load-bearing:
+    //   - nothing accrues on a tick that does not reach this partition. runRunningJob returns at the
+    //     first partition that is not DONE, so plain elapsed time would let waiting for a SIBLING
+    //     partition to publish spend this partition's window and cancel the job after one real retry.
+    //   - the attempt's own duration is charged, because a rewrite INSERT can run for a long time before
+    //     it fails (its insert timeout is half the alter timeout), so counting attempts alone would let
+    //     a 600s window stretch over hours - and the vacuum pin it holds, plus the compaction it defers,
+    //     are the reason the window exists.
+    //   - the scheduler gap is charged, so a partition whose attempts fail immediately still exhausts
+    //     the window in roughly the configured time instead of spinning until the job's own deadline.
+    //
+    // Not serialized: the job's absolute deadline (createTimeMs + timeoutMs) is already durable, so a
+    // replayed job simply starts its window over - which is the right behavior, since a failover re-runs
+    // the partition anyway.
+    private final transient Map<Long, Long> rewriteRetrySpentMs = Maps.newHashMap();
+
+    @Override
+    protected void resetTransientState() {
+        // Only the retry bookkeeping is reset here: this job family is shared-data only, and a
+        // shared-data leader demotion exits the process (StateChangeExecutor), so an in-place reset is
+        // unreachable today - a restart reloads the job from image + journal instead. Before
+        // enabling graceful in-place demotion for shared-data mode, audit the remaining transient state
+        // here (cachedDbName is self-healing, but the per-partition rewrite bookkeeping in
+        // partitionStates and any unlogged state transitions need the OptimizeJobV2-style reset).
+        rewriteRetrySpentMs.clear();
+    }
+
     /**
      * Durable per-partition state of the rewrite, journaled inside {@link #partitionStates}. Built
      * incrementally: shadowIndex/tabletCount/boundaries in PENDING, watershedVersion in WAITING_TXN,
@@ -128,6 +177,11 @@ public abstract class LakeOnlineRewriteJobBase
         Long rewriteTxnId;
         @SerializedName(value = "commitVersion")
         Long commitVersion;
+        // True when the rewrite INSERT wrote no source op_write because the partition was empty at the
+        // watershed (zero tablet commit infos). Drives the flip's shadow_rewrite_source_empty so BE
+        // synthesizes an empty op_schema_change@W for ANY W (null = not yet determined).
+        @SerializedName(value = "sourceEmpty")
+        Boolean sourceEmpty;
 
         PartitionRewriteState() {}
 
@@ -138,6 +192,7 @@ public abstract class LakeOnlineRewriteJobBase
             this.watershedVersion = other.watershedVersion;
             this.rewriteTxnId = other.rewriteTxnId;
             this.commitVersion = other.commitVersion;
+            this.sourceEmpty = other.sourceEmpty;
         }
     }
 
@@ -203,6 +258,12 @@ public abstract class LakeOnlineRewriteJobBase
     }
 
     @VisibleForTesting
+    public Boolean getSourceEmpty(long physicalPartitionId) {
+        PartitionRewriteState partitionState = partitionStates.get(physicalPartitionId);
+        return partitionState == null ? null : partitionState.sourceEmpty;
+    }
+
+    @VisibleForTesting
     public Long getRewriteTxnId(long physicalPartitionId) {
         PartitionRewriteState partitionState = partitionStates.get(physicalPartitionId);
         return partitionState == null ? null : partitionState.rewriteTxnId;
@@ -211,6 +272,12 @@ public abstract class LakeOnlineRewriteJobBase
     @VisibleForTesting
     public void setRewriteTxnIdForTest(long physicalPartitionId, long txnId) {
         stateOf(physicalPartitionId).rewriteTxnId = txnId;
+    }
+
+    @VisibleForTesting
+    public Set<Long> getPartitionIdsForTest() {
+        // A copy, not the live keySet: callers iterate it while the scheduler may touch partitionStates.
+        return Set.copyOf(partitionStates.keySet());
     }
 
     // ---- Abstract hooks: the rewrite-flavor specifics ---------------------------------------------
@@ -250,6 +317,19 @@ public abstract class LakeOnlineRewriteJobBase
      *  AlterCancelException if the rewrite config is incomplete. Called once at the top of runPendingJob,
      *  before stage 1 — the base cannot see subclass config fields. */
     protected abstract void validateRewriteConfig() throws AlterCancelException;
+
+    protected int selectRequestedTabletCount(PendingPartitionPlan plan, int activeComputeNodeCount) {
+        long targetSize = Config.tablet_reshard_target_size;
+        if (targetSize == 0) {
+            int tabletCount = Math.max(1, plan.baseIndex.getTablets().size());
+            LOG.debug("online rewrite job {} preserves {} tablets for partition {} "
+                            + "because automatic resharding is disabled",
+                    jobId, tabletCount, plan.physicalPartitionId);
+            return tabletCount;
+        }
+        Estimates estimates = new Estimates(plan.partitionDataSize, 0L);
+        return TabletPreSplitCoordinator.selectTabletCount(estimates, activeComputeNodeCount, targetSize);
+    }
 
     // ---- Overridable defaults: the range rewrite keeps these; a sibling job may override -----------
 
@@ -316,6 +396,152 @@ public abstract class LakeOnlineRewriteJobBase
     protected void afterJobSettled(boolean cancelled) {
     }
 
+    // ---- shadow-index config for the per-tablet CreateReplicaTask (createShadowTabletMetadata) --------
+    // Each subclass supplies its own shadow-index schema/key config; the shared createShadowTabletMetadata
+    // below builds the tablet schema from these so the persisted sort-key arity matches the promoted index.
+    protected abstract List<Column> getShadowSchema();
+
+    protected abstract KeysType getShadowKeysType();
+
+    protected abstract List<Integer> getShadowSortKeyIdxes();
+
+    protected abstract List<Integer> getShadowSortKeyUniqueIds();
+
+    protected abstract short getShadowShortKeyColumnCount();
+
+    /** A short label for the shadow ("rollup" / "range-rewrite") used in log and error text. */
+    protected abstract String shadowKindLabel();
+
+    /**
+     * Write each shadow tablet's version-1 metadata on its compute node, carrying the shadow index's OWN
+     * schema (its sort key), so the reshard/pre-split boundary validation reads the shadow's sort-key
+     * arity rather than the base index's. Both range subclasses build their shadow shards in the base
+     * index's shard group (shared per-partition storage path), so without this the compute node would
+     * lazily materialize a shadow tablet's version-1 metadata from the base index's shared
+     * initial-metadata template and read the BASE schema (a stale sort-key arity), which breaks the
+     * reshard/pre-split boundary validation.
+     *
+     * <p>Build one CreateReplicaTask per shadow tablet under a READ lock, then send and wait outside the
+     * lock (a network round-trip must not be held across the database lock). Tablet-creation optimization
+     * is forced off so each tablet writes its OWN per-tablet version-1 metadata instead of the shared
+     * template. Runs while the job is still PENDING (before the WAITING_TXN journal), so a failure leaves
+     * the job re-runnable: the runPendingJob cleanup drops the orphaned shards and a retry rebuilds the
+     * shadow fresh.
+     */
+    protected void createShadowTabletMetadata(List<PendingPartitionPlan> plans) throws AlterCancelException {
+        long shadowTabletCount = plans.stream()
+                .filter(plan -> plan.shadowIndex != null)
+                .mapToLong(plan -> plan.shadowIndex.getTablets().size())
+                .sum();
+        if (shadowTabletCount == 0) {
+            return;
+        }
+
+        MarkedCountDownLatch<Long, Long> countDownLatch = new MarkedCountDownLatch<>((int) shadowTabletCount);
+        AgentBatchTask batchTask;
+        // Build the tasks under a READ lock (stable table metadata + compute-node resolution), then send
+        // and wait outside the lock (a network round-trip must not be held across the database lock).
+        try (AutoCloseableLock ignore = new AutoCloseableLock(dbId, List.of(tableId), LockType.READ)) {
+            OlapTable table = getTableOrThrow();
+            batchTask = buildShadowTabletCreateTasks(table, plans, countDownLatch);
+        }
+
+        LakeRollupJob.sendAgentTaskAndWait(batchTask, countDownLatch,
+                Config.tablet_create_timeout_second * shadowTabletCount);
+    }
+
+    /**
+     * Build one {@link CreateReplicaTask} per shadow tablet, each carrying the shadow index's own tablet
+     * schema (its sort key) and its per-tablet range. The caller holds the database read lock. Split out
+     * so a unit test can assert the emitted tablet schema without a compute-node round-trip.
+     */
+    @VisibleForTesting
+    AgentBatchTask buildShadowTabletCreateTasks(@NotNull OlapTable table, List<PendingPartitionPlan> plans,
+                                                MarkedCountDownLatch<Long, Long> countDownLatch)
+            throws AlterCancelException {
+        AgentBatchTask batchTask = new AgentBatchTask();
+        WarehouseManager warehouseManager = GlobalStateMgr.getCurrentState().getWarehouseMgr();
+        long gtid = getNextGtid();
+
+        // The shadow index meta is not registered on the table until PENDING stage 3, so build the
+        // MaterializedIndexMeta from this job's shadow config -- identical to what registerShadowIndexMeta
+        // will register -- and derive the tablet schema (with the shadow's own sort key) from it.
+        MaterializedIndexMeta shadowIndexMeta = new MaterializedIndexMeta(
+                shadowIndexMetaId, getShadowSchema(), 0 /* schemaVersion */, 0 /* schemaHash */,
+                getShadowShortKeyColumnCount(), TStorageType.COLUMN, getShadowKeysType(), null /* defineStmt */,
+                getShadowSortKeyIdxes(), getShadowSortKeyUniqueIds());
+        TTabletSchema tabletSchema =
+                SchemaInfo.fromMaterializedIndex(table, shadowIndexMetaId, shadowIndexMeta).toTabletSchema();
+        String shadowKind = shadowKindLabel();
+
+        for (PendingPartitionPlan plan : plans) {
+            if (plan.shadowIndex == null) {
+                continue;
+            }
+            PhysicalPartition physicalPartition = table.getPhysicalPartition(plan.physicalPartitionId);
+            if (physicalPartition == null) {
+                throw new AlterCancelException("partition " + plan.physicalPartitionId
+                        + " was dropped while creating " + shadowKind + " shadow tablets");
+            }
+            TStorageMedium storageMedium = table.getPartitionInfo()
+                    .getDataProperty(physicalPartition.getParentId()).getStorageMedium();
+
+            // The schema file is created once per partition, with the first tablet.
+            boolean createSchemaFile = true;
+            for (Tablet shadowTablet : plan.shadowIndex.getTablets()) {
+                long shadowTabletId = shadowTablet.getId();
+                ComputeNode computeNode = null;
+                try {
+                    computeNode = warehouseManager.getComputeNodeAssignedToTablet(computeResource, shadowTabletId);
+                } catch (ErrorReportException e) {
+                    // computeNode stays null -> handled below.
+                }
+                if (computeNode == null) {
+                    throw new AlterCancelException(
+                            "no alive compute node to create " + shadowKind + " shadow tablet " + shadowTabletId);
+                }
+                countDownLatch.addMark(computeNode.getId(), shadowTabletId);
+
+                CreateReplicaTask task = CreateReplicaTask.newBuilder()
+                        .setNodeId(computeNode.getId())
+                        .setDbId(dbId)
+                        .setTableId(tableId)
+                        .setPartitionId(plan.physicalPartitionId)
+                        .setIndexId(shadowIndexMetaId)
+                        .setTabletId(shadowTabletId)
+                        .setVersion(Partition.PARTITION_INIT_VERSION)
+                        .setStorageMedium(storageMedium)
+                        .setLatch(countDownLatch)
+                        .setEnablePersistentIndex(table.enablePersistentIndex())
+                        .setPrimaryIndexCacheExpireSec(table.primaryIndexCacheExpireSec())
+                        // Carry the table's flat-json config: this per-tablet metadata replaces the shared
+                        // base template (which had it), so without this a flat-json-enabled table's shadow
+                        // tablets would lose the derivation -- as every other create-replica path sets it.
+                        .setFlatJsonConfig(table.getFlatJsonConfig())
+                        .setTabletType(TTabletType.TABLET_TYPE_LAKE)
+                        .setCompressionType(table.getCompressionType())
+                        // The compute node overwrites the tablet schema's compression level with this
+                        // request field (defaults to 0), so set it explicitly to preserve a table's
+                        // configured non-default compression level -- as every other create-replica path does.
+                        .setCompressionLevel(table.getCompressionLevel())
+                        .setCreateSchemaFile(createSchemaFile)
+                        .setTabletSchema(tabletSchema)
+                        // Force per-tablet version-1 metadata: with the optimization on the compute node
+                        // would write the shared initial-metadata template, which belongs to the base index
+                        // sharing this partition storage path. Per-tablet metadata both fixes the stale
+                        // schema read and avoids clobbering the base template.
+                        .setEnableTabletCreationOptimization(false)
+                        .setGtid(gtid)
+                        .setCompactionStrategy(table.getCompactionStrategy())
+                        .setRange(shadowTablet.getRange())
+                        .build();
+                createSchemaFile = false;
+                batchTask.addTask(task);
+            }
+        }
+        return batchTask;
+    }
+
     // ---- PENDING ---------------------------------------------------------------------------------
 
     @Override
@@ -376,6 +602,11 @@ public abstract class LakeOnlineRewriteJobBase
             for (PendingPartitionPlan plan : pendingPlans) {
                 planPartitionShadow(plan, table, cachedDbName);
             }
+
+            // Write each shadow tablet's version-1 metadata on the compute nodes (default no-op; the range
+            // rewrite and the additive rollup persist their own schema here). Still lock-free and still PENDING, so on any
+            // failure the finally below drops the orphaned shards and a retry rebuilds the shadow fresh.
+            createShadowTabletMetadata(pendingPlans);
 
             // Stage 3 (WRITE-lock commit): re-fetch and re-validate the table (TOCTOU: it may have been
             // dropped/altered while the lock was released), then install the built shadow indexes, journal
@@ -742,6 +973,13 @@ public abstract class LakeOnlineRewriteJobBase
         for (RewritePlan plan : plans) {
             switch (classifyRewrite(plan.physicalPartitionId)) {
                 case DONE:
+                    // This partition's rewrite has published. Drop its failure streak and its retry
+                    // diagnostic: errMsg is persisted, so a message journaled before a leader failover
+                    // must be cleared on observed progress, not off the transient map that replay
+                    // leaves empty. clearRetryDiagnostic only clears THIS partition's message, so a
+                    // sibling partition that is still retrying keeps reporting its stall.
+                    rewriteRetrySpentMs.remove(plan.physicalPartitionId);
+                    clearRetryDiagnostic(plan.physicalPartitionId);
                     continue;
                 case IN_FLIGHT:
                     // Committed-not-yet-visible: stay in RUNNING; the scheduler re-invokes this method.
@@ -758,7 +996,34 @@ public abstract class LakeOnlineRewriteJobBase
             }
         }
 
-        // All partitions' rewrites have published: hand off to the flip phase.
+        // All partitions' rewrites have published (every partition's rewrite txn is VISIBLE here).
+        // Record whether each rewrite produced a source op_write: a partition empty at the watershed
+        // rewrites zero rows, so there is no source op_write on object storage. The flip passes this to BE
+        // (shadow_rewrite_source_empty) so it synthesizes an empty op_schema_change@W instead of 404ing on
+        // the absent source -- this is the empty-at-W>1 case (a repeat online rewrite of an empty range
+        // partition; W==1 empty is already handled by BE). Read from the rewrite txn's (persisted)
+        // InsertTxnCommitAttachment, the same attachment classifyRewrite already relies on, so a leader
+        // failover that re-runs this recovers it; and journaled by the persist below.
+        for (long physicalPartitionId : partitionStates.keySet()) {
+            PartitionRewriteState state = partitionStates.get(physicalPartitionId);
+            if (state.sourceEmpty == null && state.rewriteTxnId != null) {
+                TransactionState txnState = GlobalStateMgr.getCurrentState().getGlobalTransactionMgr()
+                        .getTransactionState(dbId, state.rewriteTxnId);
+                if (txnState != null) {
+                    state.sourceEmpty = rewriteSourceEmpty(txnState);
+                } else {
+                    // The rewrite txn just went VISIBLE (classifyRewrite returned DONE this tick), so it is
+                    // normally still present; a replay that finds it evicted re-runs the rewrite instead of
+                    // reaching here. If it is nonetheless unavailable, leave sourceEmpty unset (treated as
+                    // false at the flip -> BE loads the source). That is safe for a non-empty partition; an
+                    // empty-at-W>1 partition would fall back to the pre-fix flip-publish retry until
+                    // recovered. Log it so the rare degradation is diagnosable rather than silent.
+                    LOG.warn("online rewrite job {}: rewrite txn {} state unavailable while recording "
+                            + "sourceEmpty for partition {}; leaving it unset", jobId, state.rewriteTxnId,
+                            physicalPartitionId);
+                }
+            }
+        }
         this.finishedTimeMs = System.currentTimeMillis();
         persistStateChange(this, JobState.FINISHED_REWRITING);
 
@@ -824,6 +1089,27 @@ public abstract class LakeOnlineRewriteJobBase
     }
 
     /**
+     * Whether a rewrite txn loaded zero rows, i.e. the partition was empty at the watershed. Read from the
+     * rewrite INSERT's {@link InsertTxnCommitAttachment} (loadedRows), which is persisted on the
+     * TransactionState and carries the same shadow-rewrite markers {@link #classifyRewrite} already reads,
+     * so it survives a leader failover. Drives {@code shadow_rewrite_source_empty} so BE synthesizes an
+     * empty {@code op_schema_change@W} for any W rather than 404ing on the absent source op_write.
+     */
+    private static boolean rewriteSourceEmpty(TransactionState txnState) {
+        // The partition was empty at the watershed iff the rewrite INSERT wrote zero rows. Read loadedRows
+        // from the rewrite txn's InsertTxnCommitAttachment: it is persisted (so it survives a leader
+        // failover) and is the only emptiness signal still available here. This runs only after the rewrite
+        // txn is VISIBLE (classifyRewrite -> DONE), and the VISIBLE finish resets
+        // TransactionState.tabletCommitInfos to null (a memory optimization, on the leader too), so the
+        // commit-info list cannot be consulted at this point. loadedRows == 0 is authoritative: a lake load
+        // that wrote rows reports them via the DPP_NORMAL_ALL counter (the same counter behind "N rows
+        // affected"), so 0 uniquely means an empty rewrite.
+        TxnCommitAttachment attachment = txnState.getTxnCommitAttachment();
+        return (attachment instanceof InsertTxnCommitAttachment)
+                && ((InsertTxnCommitAttachment) attachment).getLoadedRows() == 0;
+    }
+
+    /**
      * Build, journal, and execute one partition's watershed-pinned shadow-rewrite INSERT.
      *
      * <p>The rewrite txn id is journaled <em>before</em> the INSERT executes (an aborted txn id cannot
@@ -857,6 +1143,12 @@ public abstract class LakeOnlineRewriteJobBase
             SessionVariable sessionVariable = context.getSessionVariable();
             sessionVariable.setUsePageCache(false);
             sessionVariable.setEnableMaterializedViewRewrite(false);
+            // Force the rewrite scan to read the base index. Once a table carries sibling rollups, the
+            // synchronous-MV/rollup rewrite (enabled by default) could otherwise substitute a sibling
+            // rollup as the scan source; for AGG/UNIQUE a sibling is pre-aggregated to a different grain,
+            // which would build the new rollup from already-aggregated data. Disabling it keeps the
+            // SELECT reading the base deterministically (no-op for single-index rewrite jobs).
+            sessionVariable.setEnableSyncMaterializedViewRewrite(false);
             sessionVariable.setInsertTimeoutS((int) (timeoutMs / 2000));
 
             // Journal the rewrite txn id BEFORE executing: peekNextTransactionId() is the id the
@@ -866,7 +1158,11 @@ public abstract class LakeOnlineRewriteJobBase
             stateOf(plan.physicalPartitionId).rewriteTxnId = rewriteTxnId;
             persistStateChange(this, JobState.RUNNING);
 
+            // Time the attempt: a failure charges its own duration against the partition's retry window,
+            // because this INSERT may run for a long time before failing.
+            long attemptStartMs = System.currentTimeMillis();
             getRewriteExecutor().execute(context, insertStmt);
+            long attemptMs = System.currentTimeMillis() - attemptStartMs;
 
             // Re-confirm the txn id the INSERT actually used (defends against a concurrent txn slipping
             // in between the peek and beginTransaction) and re-journal it for the resume classifier.
@@ -877,10 +1173,46 @@ public abstract class LakeOnlineRewriteJobBase
             }
 
             if (context.getState().getStateType() == QueryState.MysqlStateType.ERR) {
-                LOG.warn("online rewrite job {}: rewrite INSERT failed for partition {}: {}",
-                        jobId, plan.physicalPartitionId, context.getState().getErrorMessage());
-                throw new AlterCancelException(context.getState().getErrorMessage());
+                String error = context.getState().getErrorMessage();
+                // Settle the attempt's transaction FIRST, so both the decision below and the next tick's
+                // classifyRewrite see its real state rather than a transient one. Returns whether the
+                // partition was actually left for a later tick to retry.
+                if (!settleFailedAttemptTxn(plan.physicalPartitionId, actualTxnId, error)) {
+                    // Not retryable: the rewrite committed and is waiting to publish, or its transaction
+                    // could not be aborted. Either way the next tick sees IN_FLIGHT and will not retry, so
+                    // do not claim a retry, and do not let the wait count against this partition's budget.
+                    // Retract a diagnostic an EARLIER failure published, too: not doing so would keep
+                    // telling SHOW ALTER TABLE COLUMN that this partition is retrying for the whole
+                    // publication or transaction-timeout wait, which is what this branch just decided is
+                    // not happening. One journal write at most, because the IN_FLIGHT arm above does not
+                    // re-enter runPartitionRewrite, so this branch is reached once per episode.
+                    rewriteRetrySpentMs.remove(plan.physicalPartitionId);
+                    clearRetryDiagnostic(plan.physicalPartitionId);
+                    LOG.warn("online rewrite job {}: rewrite INSERT reported an error for partition {}, but "
+                                    + "its transaction is not in a retryable state; waiting instead: {}",
+                            jobId, plan.physicalPartitionId, error);
+                    return;
+                }
+                if (retryPartitionRewrite(plan.physicalPartitionId, error, attemptMs)) {
+                    // The partition is retryable, so record why, for SHOW ALTER TABLE COLUMN's Msg column:
+                    // getInfo emits errMsg regardless of job state, and checkTableStable already reports a
+                    // waiting job this way.
+                    setRetryDiagnostic(retryDiagnosticPrefix(plan.physicalPartitionId) + error);
+                    // Leave the partition in NEEDS_RUN and yield the tick: runRunningJob returns right
+                    // after this call, so the next tick re-classifies this attempt's txn and re-runs just
+                    // this partition, with every published partition still skipped as DONE.
+                    return;
+                }
+                // Name the partition in the cancel reason: cancelImpl overwrites errMsg with this message,
+                // so without the id the operator loses the only thing that said which partition failed.
+                throw new AlterCancelException("rewrite INSERT failed for partition "
+                        + plan.physicalPartitionId + ": " + error);
             }
+            // The attempt reached the executor without error: end any failure streak for this partition
+            // and drop the retry diagnostic it published, so the message does not outlive the failure
+            // through the publication wait.
+            rewriteRetrySpentMs.remove(plan.physicalPartitionId);
+            clearRetryDiagnostic(plan.physicalPartitionId);
         } catch (AlterCancelException e) {
             throw e;
         } catch (Exception e) {
@@ -888,6 +1220,182 @@ public abstract class LakeOnlineRewriteJobBase
                     + ": " + e.getMessage());
         } finally {
             context.setScanVersionOverride(null);
+        }
+    }
+
+    /**
+     * Decide whether a failed rewrite INSERT for one partition should be retried on a later scheduler
+     * tick instead of cancelling the whole job.
+     *
+     * <p>Failures are not classified, deliberately: one physical cause - a compute node going away
+     * mid-INSERT - reaches this point as several different error codes and messages, sometimes with no
+     * error code at all, so the budget is a bounded number of attempts rather than an error predicate.
+     * The sibling jobs make the same choice by counting failures rather than inspecting them (see
+     * {@link LakeTableSchemaChangeJob#runRunningJob}, which cancels only after a task has failed three
+     * times). A genuinely broken rewrite still fails the job, just a budget later, and the job's own
+     * deadline ({@link #isTimeout()}) remains the absolute bound. Note this covers failures the executor
+     * reports through the {@code ConnectContext}; a throw that escapes it is still terminal, which is why
+     * the surrounding {@code catch} converts one straight to {@link AlterCancelException}.
+     *
+     * <p>The window is per partition and is spent by that partition's own consecutive failed attempts -
+     * each charging how long it ran plus the one scheduler gap before it can be retried - reset by a
+     * successful attempt or by the partition publishing, because one job can legitimately meet several
+     * independent node restarts. Time the job spends elsewhere is not charged to it; see
+     * {@link #rewriteRetrySpentMs}.
+     *
+     * <p>Retrying is safe: an aborted attempt publishes nothing into the shadow index. The flip anchors
+     * only the journaled txn id of the attempt that committed, and post-watershed double-writes are
+     * replayed by version rather than by txn, so a re-run cannot double-count.
+     *
+     * @param attemptMs how long the failed attempt ran, charged against the window along with one
+     *         scheduler gap
+     * @return true when the caller should return and let a later tick retry, false when it should cancel
+     */
+    private boolean retryPartitionRewrite(long physicalPartitionId, String error, long attemptMs) {
+        // One sample of the mutable window for the whole decision. Re-reading it would let an
+        // ADMIN SET FRONTEND CONFIG landing mid-decision make the gate below, the window the charge is
+        // compared against, and the window the message reports all disagree - so a value dropped to 0
+        // after the gate had passed could still grant the retry the operator just disabled. Same rule as
+        // selectRequestedTabletCount above and TabletReshardUtils.adaptiveSplitBound.
+        int retryWindowSecond = Config.lake_online_rewrite_partition_retry_timeout_second;
+        if (retryWindowSecond <= 0) {
+            LOG.warn("online rewrite job {}: rewrite INSERT failed for partition {} and retrying is "
+                    + "disabled: {}", jobId, physicalPartitionId, error);
+            return false;
+        }
+        long budgetMs = retryWindowSecond * 1000L;
+        boolean firstFailureOfEpisode = !rewriteRetrySpentMs.containsKey(physicalPartitionId);
+        // Charge this attempt BEFORE deciding, so the window is compared against what the episode has
+        // actually spent including it. Deciding on the running total first meant the attempt that
+        // crossed the window was followed by one more full rewrite INSERT before anything noticed, and
+        // one INSERT may run for half the alter timeout.
+        // One sample of the interval, and the only read of it in this decision.
+        long chargedMs = attemptMs + Math.max(0L, Config.alter_scheduler_interval_millisecond);
+        long spentMs = rewriteRetrySpentMs.merge(physicalPartitionId, chargedMs, Long::sum);
+        // The first failure of an episode is always retried, however long its attempt ran. A partition
+        // whose rewrite legitimately takes longer than the window would otherwise be cancelled by its
+        // first transient failure - discarding every partition already rewritten, which is the behavior
+        // this retry exists to replace. So an episode costs about the window, plus that one guaranteed
+        // retry when a single attempt is longer than the whole window.
+        if (!firstFailureOfEpisode && spentMs >= budgetMs) {
+            LOG.warn("online rewrite job {}: rewrite INSERT for partition {} has spent {}s of its {}s "
+                            + "retry window, cancelling the job: {}",
+                    jobId, physicalPartitionId, spentMs / 1000, retryWindowSecond, error);
+            return false;
+        }
+        LOG.warn("online rewrite job {}: rewrite INSERT failed for partition {} after {}ms, retrying on a "
+                        + "later tick ({}s of its {}s retry window spent): {}",
+                jobId, physicalPartitionId, attemptMs, spentMs / 1000, retryWindowSecond, error);
+        return true;
+    }
+
+    /**
+     * Settle a failed attempt's transaction so the next tick's {@link #classifyRewrite} sees a state it
+     * can act on, and report whether the partition was left for a later tick to RETRY.
+     *
+     * <p>Four outcomes, and the distinction matters because the caller must neither claim a retry nor
+     * spend the retry budget on a partition that is not going to be retried:
+     * <ul>
+     *   <li>no transaction was begun - the id journaled before the INSERT is only
+     *       {@code peekNextTransactionId()}'s prediction and a concurrent load may take it, so it is
+     *       cleared and re-journaled; a null id classifies as NEEDS_RUN. Retryable.</li>
+     *   <li>PREPARE/PREPARED - aborted here, so the next tick sees ABORTED rather than IN_FLIGHT.
+     *       Retryable, unless the abort fails or declines the transition, both of which leave the
+     *       partition waiting for the transaction's own timeout and NOT retryable now; the status is
+     *       re-read afterwards rather than assumed.</li>
+     *   <li>COMMITTED - the deliberate publication wait: the lake publisher carries it to VISIBLE and
+     *       {@link #classifyRewrite} then reports DONE, so there is nothing to abort and nothing to
+     *       retry. Skipping the call also avoids the transaction manager refusing to abort a COMMITTED
+     *       transaction, and the WARN that refusal logs, on every tick of the publication wait.</li>
+     *   <li>already terminal - ABORTED is retryable; VISIBLE means the partition is in fact DONE.</li>
+     * </ul>
+     *
+     * @return true iff a later tick will re-run this partition's rewrite
+     */
+    private boolean settleFailedAttemptTxn(long physicalPartitionId, long actualTxnId, String reason) {
+        if (actualTxnId == DmlStmt.INVALID_TXN_ID) {
+            stateOf(physicalPartitionId).rewriteTxnId = null;
+            persistStateChange(this, JobState.RUNNING);
+            return true;
+        }
+        TransactionState txnState =
+                GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().getTransactionState(dbId, actualTxnId);
+        if (txnState == null) {
+            return true;
+        }
+        TransactionStatus status = txnState.getTransactionStatus();
+        if (status.isFinalStatus()) {
+            return status == TransactionStatus.ABORTED;
+        }
+        if (status != TransactionStatus.PREPARE && status != TransactionStatus.PREPARED) {
+            return false;
+        }
+        try {
+            GlobalStateMgr.getCurrentState().getGlobalTransactionMgr()
+                    .abortTransaction(dbId, actualTxnId, reason);
+        } catch (Exception e) {
+            LOG.warn("online rewrite job {}: failed to abort rewrite txn {} for partition {} before "
+                            + "retrying, so it waits for the transaction timeout instead: {}",
+                    jobId, actualTxnId, physicalPartitionId, e.getMessage());
+            return false;
+        }
+        // Report what the transaction now IS, rather than inferring it from the abort having returned.
+        // abortTransaction is a no-op that returns normally whenever unprotectAbortTransaction declines
+        // the transition - today only for an already-ABORTED state, and for a PREPARED one when the
+        // caller did not ask for prepared transactions to be aborted, which this call does ask for. That
+        // second exemption is decided in GlobalTransactionMgr rather than here, so read the outcome
+        // instead of depending on it: only a state the next tick actually re-runs may claim a retry.
+        // (A concurrent commit is not this case - unprotectAbortTransaction throws
+        // TransactionAlreadyCommitException for COMMITTED/VISIBLE, which the catch above turns into a
+        // wait.) A vanished transaction classifies as NEEDS_RUN, so it counts as re-runnable.
+        TransactionState settled = GlobalStateMgr.getCurrentState().getGlobalTransactionMgr()
+                .getTransactionState(dbId, actualTxnId);
+        return settled == null || settled.getTransactionStatus() == TransactionStatus.ABORTED;
+    }
+
+    /**
+     * The retry diagnostic this job publishes through {@code errMsg} for one partition. The partition id
+     * is part of the message on purpose: {@code errMsg} is persisted, so after a leader failover the
+     * transient failure map is gone and the message itself is the only thing that still says which
+     * partition it belongs to.
+     */
+    private static String retryDiagnosticPrefix(long physicalPartitionId) {
+        return "rewrite INSERT failed for partition " + physicalPartitionId + ", retrying: ";
+    }
+
+    /**
+     * Publish the retry diagnostic through {@code errMsg} and journal it, so the reason a partition is
+     * stalled survives a leader failover. {@code errMsg} is written after this attempt's own
+     * {@code persistStateChange} calls, so without journaling it here a replay would restore the
+     * preceding snapshot and {@code SHOW ALTER TABLE COLUMN} would lose the reason.
+     *
+     * <p>Journals only when the message actually changes. That saves a write when a partition fails
+     * identically on consecutive ticks, but many error strings embed a txn or query id, so a stalled
+     * partition should be expected to journal roughly once per tick for the length of its budget; a job
+     * with no failures costs nothing.
+     */
+    private void setRetryDiagnostic(String diagnostic) {
+        if (diagnostic.equals(errMsg)) {
+            return;
+        }
+        errMsg = diagnostic;
+        persistStateChange(this, JobState.RUNNING);
+    }
+
+    /**
+     * Drop the retry diagnostic iff it is the one this partition published. Clearing unconditionally
+     * would erase a sibling partition's active retry message and hide that partition's stall.
+     * Null-safe: a replayed {@code errMsg} can be null if the journal carried an explicit JSON null.
+     *
+     * <p>The clear is journaled for the same reason the set is: otherwise a failover during the
+     * publication wait would restore the stale failure message onto a partition whose rewrite actually
+     * succeeded. The prefix guard already makes this fire only when there is something to clear, so it
+     * costs exactly one write per clear.
+     */
+    private void clearRetryDiagnostic(long physicalPartitionId) {
+        if (errMsg != null && errMsg.startsWith(retryDiagnosticPrefix(physicalPartitionId))) {
+            errMsg = "";
+            persistStateChange(this, JobState.RUNNING);
         }
     }
 
@@ -1113,7 +1621,7 @@ public abstract class LakeOnlineRewriteJobBase
                 Preconditions.checkState(watershedVersion != null,
                         "watershed version not captured for partition " + physicalPartitionId);
                 publishInfos.add(new PartitionPublishInfo(shadowTablets, originTablets,
-                        commitVersion, rewriteTxnId, watershedVersion));
+                        commitVersion, rewriteTxnId, watershedVersion, Boolean.TRUE.equals(state.sourceEmpty)));
             }
         } catch (AlterCancelException e) {
             LOG.warn("online rewrite job {}: table dropped before publish", jobId);
@@ -1142,6 +1650,8 @@ public abstract class LakeOnlineRewriteJobBase
                 shadowTxnInfo.commitTime = finishedTimeMs / 1000;
                 shadowTxnInfo.gtid = watershedGtid;
                 shadowTxnInfo.shadowRewriteAlterVersion = info.watershedVersion;
+                // Empty at the watershed: BE synthesizes an empty op_schema_change@W with no source load.
+                shadowTxnInfo.shadowRewriteSourceEmpty = info.sourceEmpty;
                 if (!isFileBundling) {
                     Utils.publishVersion(info.shadowTablets, shadowTxnInfo, 1, info.commitVersion,
                             computeResource, false);
@@ -1172,14 +1682,16 @@ public abstract class LakeOnlineRewriteJobBase
         final long commitVersion;
         final long rewriteTxnId;
         final long watershedVersion;
+        final boolean sourceEmpty;
 
         PartitionPublishInfo(List<Tablet> shadowTablets, List<Tablet> originTablets,
-                             long commitVersion, long rewriteTxnId, long watershedVersion) {
+                             long commitVersion, long rewriteTxnId, long watershedVersion, boolean sourceEmpty) {
             this.shadowTablets = shadowTablets;
             this.originTablets = originTablets;
             this.commitVersion = commitVersion;
             this.rewriteTxnId = rewriteTxnId;
             this.watershedVersion = watershedVersion;
+            this.sourceEmpty = sourceEmpty;
         }
     }
 
@@ -1519,15 +2031,16 @@ public abstract class LakeOnlineRewriteJobBase
             }
 
             if (jobState == JobState.PENDING) {
-                // A PENDING job has installed NO durable catalog state yet. On the leader the shadow index
-                // meta + tablets are registered only inside the WAITING_TXN applier (runPendingJob),
+                // A PENDING job has installed no durable shadow catalog state yet. On the leader the shadow
+                // index meta + tablets are registered only inside the WAITING_TXN applier (runPendingJob),
                 // atomically with the WAITING_TXN journal entry, so the only PENDING journal entry (the
                 // initial ALTER log) carries empty partitionStates and nothing installed. Reconstructing
                 // here would call registerShadowIndexMeta with no per-partition shadow index, leaving the
                 // table with a shadow schema that OlapTableSink.createSchema() sees while createPartition()
                 // has no matching partition index -- loads to the table then fail until the job advances.
-                // So replay installs nothing for PENDING; the resuming leader's runPendingJob builds the
-                // shadow fresh.
+                // Replay must still restore the table reservation; the resuming leader's runPendingJob builds
+                // the shadow fresh.
+                table.setState(jobTableState());
                 LOG.info("Replaying PENDING online rewrite job {}; no durable shadow state to reconstruct.", jobId);
             } else if (jobState == JobState.WAITING_TXN || jobState == JobState.RUNNING) {
                 // WAITING_TXN and RUNNING share the same durable catalog state: the shadow index meta is

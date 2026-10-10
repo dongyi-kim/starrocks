@@ -22,6 +22,7 @@
 #include "column/column.h"
 #include "column/const_column.h"
 #include "column/decimalv3_column.h"
+#include "column/file_column.h"
 #include "column/json_column.h"
 #include "column/map_column.h"
 #include "column/object_column.h"
@@ -78,11 +79,6 @@ Status AppendWithMaskVisitor<PositiveSelect>::do_visit(NullableColumn* column) {
 
 template <bool PositiveSelect>
 Status AppendWithMaskVisitor<PositiveSelect>::do_visit(BinaryColumn* column) {
-    return append_binary(column);
-}
-
-template <bool PositiveSelect>
-Status AppendWithMaskVisitor<PositiveSelect>::do_visit(LargeBinaryColumn* column) {
     return append_binary(column);
 }
 

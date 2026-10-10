@@ -47,27 +47,34 @@
 #include "base/metrics.h"
 #include "base/testutil/assert.h"
 #include "base/testutil/sync_point.h"
+#include "base/time/monotime.h"
 #include "base/utility/defer_op.h"
 #include "common/config_ingest_fwd.h"
 #include "common/config_storage_fwd.h"
 #include "common/process_exit.h"
 #include "common/status.h"
 #include "common/system/cpu_info.h"
+#include "common/thread/threadpool.h"
+#include "common/util/bthreads/executor.h"
 #include "compute_env/compute_env.h"
+#include "compute_env/load/http_load_params.h"
 #include "compute_env/load/stream_load_context.h"
 #include "compute_env/load/stream_load_pipe.h"
+#include "data_workflows/load/batch_write/batch_write_mgr.h"
+#include "data_workflows/load/stream_load/stream_load_executor.h"
 #include "exec/exec_env.h"
 #include "exec/pipeline/driver_executor_factory.h"
 #include "exec/pipeline/driver_queue_factory.h"
-#include "exec/stream_load/http_load_params.h"
-#include "exec/stream_load/stream_load_executor.h"
 #include "gen_cpp/FrontendService_types.h"
 #include "gen_cpp/HeartbeatService_types.h"
 #include "orchestration/stream_load_orchestrator.h"
 #include "platform/http/http_channel.h"
 #include "platform/http/http_request.h"
 #include "platform/platform_env.h"
+#include "runtime/byte_buffer.h"
+#include "runtime/mem_tracker.h"
 #include "runtime/runtime_env.h"
+#include "simdjson.h"
 
 class mg_connection;
 
@@ -137,18 +144,30 @@ public:
         ASSERT_OK(init_platform_env_for_stream_load_test(&_metrics, &_owns_platform_env));
         ASSERT_OK(_compute_env.init(make_stream_load_compute_env_options(&_metrics)));
         _env.set_compute_env(&_compute_env);
-        _env._stream_load_executor = new StreamLoadExecutor(&_env);
+        _stream_load_executor = std::make_unique<StreamLoadExecutor>();
         _env._refresh_service_contexts();
         ASSERT_NE(nullptr, _env.load_stream_mgr());
         ASSERT_NE(nullptr, _env.stream_context_mgr());
+
+        std::unique_ptr<ThreadPool> batch_write_thread_pool;
+        ASSERT_OK(ThreadPoolBuilder("StreamLoadActionTest")
+                          .set_min_threads(0)
+                          .set_max_threads(1)
+                          .set_max_queue_size(16)
+                          .set_idle_timeout(MonoDelta::FromMilliseconds(10000))
+                          .build(&batch_write_thread_pool));
+        auto batch_write_executor =
+                std::make_unique<bthreads::ThreadPoolExecutor>(batch_write_thread_pool.release(), kTakesOwnership);
+        _batch_write_mgr = std::make_unique<BatchWriteMgr>(_env.load_stream_mgr(), std::move(batch_write_executor));
+        ASSERT_OK(_batch_write_mgr->init());
 
         _evhttp_req = evhttp_request_new(nullptr, nullptr);
         _evhttp_req->remote_host = nullptr;
         _limiter.reset(new ConcurrentLimiter(1000));
     }
     void TearDown() override {
-        delete _env._stream_load_executor;
-        _env._stream_load_executor = nullptr;
+        _batch_write_mgr.reset();
+        _stream_load_executor.reset();
         _env.set_compute_env(nullptr);
         _compute_env.destroy();
         if (_owns_platform_env) {
@@ -168,12 +187,15 @@ private:
     orchestration::StreamLoadOrchestrator _stream_load_orchestrator{&_env, nullptr};
     evhttp_request* _evhttp_req = nullptr;
     std::unique_ptr<ConcurrentLimiter> _limiter;
+    std::unique_ptr<StreamLoadExecutor> _stream_load_executor;
+    std::unique_ptr<BatchWriteMgr> _batch_write_mgr;
     MetricRegistry _metrics{"stream_load_action_test"};
     bool _owns_platform_env = false;
 };
 
 TEST_F(StreamLoadActionTest, no_auth) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request.set_handler(&action);
@@ -187,7 +209,7 @@ TEST_F(StreamLoadActionTest, no_auth) {
 
 #if 0
 TEST_F(StreamLoadActionTest, no_content_length) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(), _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
@@ -201,7 +223,7 @@ TEST_F(StreamLoadActionTest, no_content_length) {
 }
 
 TEST_F(StreamLoadActionTest, unknown_encoding) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(), _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
@@ -217,7 +239,8 @@ TEST_F(StreamLoadActionTest, unknown_encoding) {
 #endif
 
 TEST_F(StreamLoadActionTest, normal) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
@@ -235,7 +258,8 @@ TEST_F(StreamLoadActionTest, normal) {
 }
 
 TEST_F(StreamLoadActionTest, process_exit_abort_stream_load) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
@@ -266,7 +290,8 @@ TEST_F(StreamLoadActionTest, process_exit_abort_stream_load) {
 }
 
 TEST_F(StreamLoadActionTest, put_fail) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
 
@@ -284,7 +309,8 @@ TEST_F(StreamLoadActionTest, put_fail) {
 }
 
 TEST_F(StreamLoadActionTest, commit_fail) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
@@ -301,7 +327,8 @@ TEST_F(StreamLoadActionTest, commit_fail) {
 }
 
 TEST_F(StreamLoadActionTest, commit_try) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
@@ -318,7 +345,8 @@ TEST_F(StreamLoadActionTest, commit_try) {
 }
 
 TEST_F(StreamLoadActionTest, begin_fail) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
@@ -336,7 +364,7 @@ TEST_F(StreamLoadActionTest, begin_fail) {
 
 #if 0
 TEST_F(StreamLoadActionTest, receive_failed) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(), _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
@@ -356,7 +384,8 @@ TEST_F(StreamLoadActionTest, plan_fail) {
     SyncPoint::GetInstance()->SetCallBack("StreamLoadExecutor::execute_plan_fragment:1",
                                           [](void* arg) { *((Status*)arg) = Status::InternalError("TestFail"); });
 
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
@@ -375,7 +404,8 @@ TEST_F(StreamLoadActionTest, plan_fail) {
 }
 
 TEST_F(StreamLoadActionTest, huge_malloc) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
     auto ctx = new StreamLoadContext(_env.load_stream_mgr());
     ctx->ref();
     ctx->body_sink = std::make_shared<StreamLoadPipe>();
@@ -458,7 +488,8 @@ TEST_F(StreamLoadActionTest, batch_write_csv) {
         SyncPoint::GetInstance()->DisableProcessing();
     });
 
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
     HttpRequest request(_evhttp_req);
 
     request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
@@ -481,13 +512,15 @@ TEST_F(StreamLoadActionTest, batch_write_csv) {
     ASSERT_NE(nullptr, ctx);
     ASSERT_TRUE(ctx->status.ok());
     ASSERT_TRUE(ctx->enable_batch_write);
-    ASSERT_NE(nullptr, ctx->buffer);
-    ASSERT_EQ(content.length(), ctx->buffer->limit);
+    ASSERT_EQ(nullptr, ctx->buffer);
 
     evbuffer_add(evb, content.data(), content.size());
     ctx->status = Status::OK();
     action.on_chunk_data(&request);
     ASSERT_TRUE(ctx->status.ok());
+    ASSERT_NE(nullptr, ctx->buffer);
+    ASSERT_EQ(content.length(), ctx->buffer->limit);
+    ASSERT_EQ(0, ctx->buffer->padding);
     ASSERT_EQ(content.length(), ctx->buffer->pos);
 
     SyncPoint::GetInstance()->SetCallBack("BatchWriteMgr::append_data::cb",
@@ -517,7 +550,8 @@ TEST_F(StreamLoadActionTest, batch_write_json) {
         SyncPoint::GetInstance()->DisableProcessing();
     });
 
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
     HttpRequest request(_evhttp_req);
 
     request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
@@ -539,13 +573,15 @@ TEST_F(StreamLoadActionTest, batch_write_json) {
     ASSERT_NE(nullptr, ctx);
     ASSERT_TRUE(ctx->status.ok());
     ASSERT_TRUE(ctx->enable_batch_write);
-    ASSERT_NE(nullptr, ctx->buffer);
-    ASSERT_EQ(content.length(), ctx->buffer->limit);
+    ASSERT_EQ(nullptr, ctx->buffer);
 
     evbuffer_add(evb, content.data(), content.size());
     ctx->status = Status::OK();
     action.on_chunk_data(&request);
     ASSERT_TRUE(ctx->status.ok());
+    ASSERT_NE(nullptr, ctx->buffer);
+    ASSERT_EQ(content.length(), ctx->buffer->limit);
+    ASSERT_EQ(simdjson::SIMDJSON_PADDING, ctx->buffer->padding);
     ASSERT_EQ(content.length(), ctx->buffer->pos);
 
     SyncPoint::GetInstance()->SetCallBack("BatchWriteMgr::append_data::cb",
@@ -566,8 +602,190 @@ TEST_F(StreamLoadActionTest, batch_write_json) {
     ASSERT_STREQ("Success", doc["Status"].GetString());
 }
 
+TEST_F(StreamLoadActionTest, batch_write_empty_body) {
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("BatchWriteMgr::append_data::success");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
+    HttpRequest request(_evhttp_req);
+
+    request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
+    request._params.emplace(HTTP_DB_KEY, "db");
+    request._params.emplace(HTTP_TABLE_KEY, "tbl");
+    request._headers.emplace(HTTP_LABEL_KEY, "batch_write_empty_body");
+    request._headers.emplace(HTTP_ENABLE_MERGE_COMMIT, "true");
+    request._headers.emplace(HTTP_FORMAT_KEY, "json");
+    request._headers.emplace(HttpHeaders::CONTENT_LENGTH, "0");
+    request.set_handler(&action);
+
+    ASSERT_EQ(0, action.on_header(&request));
+    StreamLoadContext* ctx = static_cast<StreamLoadContext*>(request._handler_ctx);
+    ASSERT_NE(nullptr, ctx);
+    ASSERT_TRUE(ctx->enable_batch_write);
+    ASSERT_EQ(nullptr, ctx->buffer);
+
+    SyncPoint::GetInstance()->SetCallBack("BatchWriteMgr::append_data::success",
+                                          [](void* arg) { *(Status*)arg = Status::OK(); });
+    action.handle(&request);
+    ASSERT_TRUE(ctx->status.ok());
+    ASSERT_NE(nullptr, ctx->buffer);
+    ASSERT_EQ(0, ctx->buffer->limit);
+
+    rapidjson::Document doc;
+    doc.Parse(k_response_str.c_str());
+    ASSERT_STREQ("Success", doc["Status"].GetString());
+}
+
+TEST_F(StreamLoadActionTest, json_buffer_allocated_on_chunk_data) {
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
+    auto load_mem_tracker = std::make_shared<MemTracker>(-1, "json_buffer_allocated_on_chunk_data");
+    HttpRequest request(_evhttp_req);
+
+    std::string content = "{\"c0\":\"a\",\"c1\":\"b\"}";
+    request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
+    request._headers.emplace(HTTP_FORMAT_KEY, "json");
+    request._headers.emplace(HttpHeaders::CONTENT_LENGTH, std::to_string(content.length()));
+    request.set_handler(&action);
+
+    ASSERT_EQ(0, action.on_header(&request));
+    StreamLoadContext* ctx = static_cast<StreamLoadContext*>(request._handler_ctx);
+    ASSERT_NE(nullptr, ctx);
+    ASSERT_TRUE(ctx->status.ok());
+    ASSERT_FALSE(ctx->enable_batch_write);
+    ASSERT_EQ(TFileFormatType::FORMAT_JSON, ctx->format);
+    ASSERT_EQ(nullptr, ctx->buffer);
+
+    ctx->instance_mem_tracker = load_mem_tracker;
+    auto evb = request.get_evhttp_request()->input_buffer;
+    evbuffer_add(evb, content.data(), content.size());
+    action.on_chunk_data(&request);
+    ASSERT_TRUE(ctx->status.ok());
+    ASSERT_NE(nullptr, ctx->buffer);
+    ASSERT_EQ(content.length(), ctx->buffer->limit);
+    ASSERT_EQ(simdjson::SIMDJSON_PADDING, ctx->buffer->padding);
+    ASSERT_EQ(content.length(), ctx->buffer->pos);
+    auto* deleter = std::get_deleter<MemTrackerDeleter>(ctx->buffer);
+    ASSERT_NE(nullptr, deleter);
+    ASSERT_EQ(load_mem_tracker.get(), deleter->tracker);
+}
+
+TEST_F(StreamLoadActionTest, json_buffer_allocate_fail) {
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
+    HttpRequest request(_evhttp_req);
+
+    std::string content = "{\"c0\":\"a\",\"c1\":\"b\"}";
+    request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
+    request._headers.emplace(HTTP_FORMAT_KEY, "json");
+    request._headers.emplace(HttpHeaders::CONTENT_LENGTH, std::to_string(content.length()));
+    request.set_handler(&action);
+
+    ASSERT_EQ(0, action.on_header(&request));
+    StreamLoadContext* ctx = static_cast<StreamLoadContext*>(request._handler_ctx);
+    ASSERT_NE(nullptr, ctx);
+
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("ByteBuffer::allocate_with_tracker");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    SyncPoint::GetInstance()->SetCallBack("ByteBuffer::allocate_with_tracker",
+                                          [](void* arg) { *((Status*)arg) = Status::MemoryLimitExceeded("TestFail"); });
+    auto evb = request.get_evhttp_request()->input_buffer;
+    evbuffer_add(evb, content.data(), content.size());
+    action.on_chunk_data(&request);
+    ASSERT_TRUE(ctx->status.is_mem_limit_exceeded());
+    ASSERT_EQ(nullptr, ctx->buffer);
+}
+
+TEST_F(StreamLoadActionTest, json_without_content_length) {
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
+    HttpRequest request(_evhttp_req);
+
+    std::string content = "{\"c0\":\"a\",\"c1\":\"b\"}";
+    request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
+    request._headers.emplace(HTTP_FORMAT_KEY, "json");
+    request.set_handler(&action);
+
+    ASSERT_EQ(0, action.on_header(&request));
+    StreamLoadContext* ctx = static_cast<StreamLoadContext*>(request._handler_ctx);
+    ASSERT_NE(nullptr, ctx);
+    ASSERT_EQ(0, ctx->body_bytes);
+    ASSERT_EQ(nullptr, ctx->buffer);
+
+    auto evb = request.get_evhttp_request()->input_buffer;
+    evbuffer_add(evb, content.data(), content.size());
+    action.on_chunk_data(&request);
+    ASSERT_TRUE(ctx->status.ok());
+    ASSERT_NE(nullptr, ctx->buffer);
+    ASSERT_EQ(StreamLoadContext::kDefaultBufferSize, ctx->buffer->limit);
+    ASSERT_EQ(0, ctx->buffer->padding);
+    ASSERT_EQ(content.length(), ctx->buffer->pos);
+}
+
+TEST_F(StreamLoadActionTest, json_exceed_max_batch_size) {
+    auto old_max_batch_size_mb = config::streaming_load_max_batch_size_mb;
+    config::streaming_load_max_batch_size_mb = 0;
+    DeferOp defer([&]() { config::streaming_load_max_batch_size_mb = old_max_batch_size_mb; });
+
+    std::string content = "{\"c0\":\"a\",\"c1\":\"b\"}";
+    {
+        StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                                _batch_write_mgr.get());
+        HttpRequest request(_evhttp_req);
+        request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
+        request._headers.emplace(HTTP_FORMAT_KEY, "json");
+        request._headers.emplace(HttpHeaders::CONTENT_LENGTH, std::to_string(content.length()));
+        request.set_handler(&action);
+
+        ASSERT_EQ(-1, action.on_header(&request));
+        rapidjson::Document doc;
+        doc.Parse(k_response_str.c_str());
+        ASSERT_STREQ("Fail", doc["Status"].GetString());
+        ASSERT_NE(nullptr, std::strstr(doc["Message"].GetString(), "exceed the max size"));
+    }
+    {
+        StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                                _batch_write_mgr.get());
+        HttpRequest request(_evhttp_req);
+        request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
+        request._headers.emplace(HTTP_FORMAT_KEY, "json");
+        request._headers.emplace(HttpHeaders::CONTENT_LENGTH, std::to_string(content.length()));
+        request._headers.emplace(HTTP_IGNORE_JSON_SIZE, "true");
+        request.set_handler(&action);
+
+        ASSERT_EQ(0, action.on_header(&request));
+        StreamLoadContext* ctx = static_cast<StreamLoadContext*>(request._handler_ctx);
+        ASSERT_NE(nullptr, ctx);
+        ASSERT_TRUE(ctx->status.ok());
+    }
+}
+
+TEST_F(StreamLoadActionTest, unknown_format) {
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
+    HttpRequest request(_evhttp_req);
+    request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
+    request._headers.emplace(HTTP_FORMAT_KEY, "unknown_format");
+    request._headers.emplace(HttpHeaders::CONTENT_LENGTH, "0");
+    request.set_handler(&action);
+
+    ASSERT_EQ(-1, action.on_header(&request));
+    rapidjson::Document doc;
+    doc.Parse(k_response_str.c_str());
+    ASSERT_STREQ("Fail", doc["Status"].GetString());
+    ASSERT_NE(nullptr, std::strstr(doc["Message"].GetString(), "unknown data format"));
+}
+
 TEST_F(StreamLoadActionTest, enable_batch_write_wrong_argument) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request._params.emplace(HTTP_DB_KEY, "db");
@@ -667,7 +885,8 @@ TEST_F(StreamLoadActionTest, merge_commit_response) {
 }
 
 TEST_F(StreamLoadActionTest, url_db_key_decode_fail) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request._params.emplace(HTTP_DB_KEY, "%RR");
@@ -676,7 +895,8 @@ TEST_F(StreamLoadActionTest, url_db_key_decode_fail) {
 }
 
 TEST_F(StreamLoadActionTest, url_table_key_decode_fail) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request._params.emplace(HTTP_DB_KEY, "db");
@@ -686,7 +906,8 @@ TEST_F(StreamLoadActionTest, url_table_key_decode_fail) {
 }
 
 TEST_F(StreamLoadActionTest, invalid_envelope) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
 
     HttpRequest request(_evhttp_req);
     request._params.emplace(HTTP_DB_KEY, "db");
@@ -716,7 +937,8 @@ TEST_F(StreamLoadActionTest, stream_load_put_rpc_timeout_setting) {
     };
 
     for (const auto& tc : test_cases) {
-        StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+        StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                                _batch_write_mgr.get());
         SyncPoint::GetInstance()->EnableProcessing();
         DeferOp defer([]() {
             SyncPoint::GetInstance()->ClearCallBack("StreamLoadAction::_process_put::rpc_timeout");
@@ -744,7 +966,8 @@ TEST_F(StreamLoadActionTest, stream_load_put_rpc_timeout_setting) {
 }
 
 TEST_F(StreamLoadActionTest, format_arrow) {
-    StreamLoadAction action(&_env, &_stream_load_orchestrator, _limiter.get());
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
     HttpRequest request(_evhttp_req);
     request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
     request._params.emplace(HTTP_DB_KEY, "db");
@@ -756,6 +979,167 @@ TEST_F(StreamLoadActionTest, format_arrow) {
     StreamLoadContext* ctx = static_cast<StreamLoadContext*>(request._handler_ctx);
     ASSERT_NE(nullptr, ctx);
     ASSERT_EQ(TFileFormatType::FORMAT_ARROW, ctx->format);
+}
+
+// Numeric request headers are attacker-controlled. std::stoll throws
+// std::invalid_argument on a value that is not a number and std::out_of_range
+// on one that does not fit; in production these run inside a libevent callback
+// with no handler above them, so a throw takes down the whole BE process
+// instead of failing the one request.
+TEST_F(StreamLoadActionTest, content_length_not_a_number) {
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
+
+    HttpRequest request(_evhttp_req);
+    request._params.emplace(HTTP_DB_KEY, "db");
+    request._params.emplace(HTTP_TABLE_KEY, "tbl");
+    request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
+    request._headers.emplace(HttpHeaders::CONTENT_LENGTH, "not-a-number");
+    request.set_handler(&action);
+    action.on_header(&request);
+    action.handle(&request);
+
+    rapidjson::Document doc;
+    doc.Parse(k_response_str.c_str());
+    ASSERT_STREQ("Fail", doc["Status"].GetString());
+    ASSERT_NE(nullptr, std::strstr(doc["Message"].GetString(), "Content-Length"));
+}
+
+TEST_F(StreamLoadActionTest, content_length_does_not_fit_in_int64) {
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
+
+    HttpRequest request(_evhttp_req);
+    request._params.emplace(HTTP_DB_KEY, "db");
+    request._params.emplace(HTTP_TABLE_KEY, "tbl");
+    request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
+    request._headers.emplace(HttpHeaders::CONTENT_LENGTH, "99999999999999999999");
+    request.set_handler(&action);
+    action.on_header(&request);
+    action.handle(&request);
+
+    rapidjson::Document doc;
+    doc.Parse(k_response_str.c_str());
+    ASSERT_STREQ("Fail", doc["Status"].GetString());
+    ASSERT_NE(nullptr, std::strstr(doc["Message"].GetString(), "Content-Length"));
+}
+
+// skip_header was already wrapped in a try block, but it only caught
+// std::invalid_argument. std::out_of_range is a sibling of that type, not a
+// subclass, so an over-long number escaped the handler.
+TEST_F(StreamLoadActionTest, skip_header_does_not_fit_in_int64) {
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
+
+    HttpRequest request(_evhttp_req);
+    request._params.emplace(HTTP_DB_KEY, "db");
+    request._params.emplace(HTTP_TABLE_KEY, "tbl");
+    request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
+    request._headers.emplace(HttpHeaders::CONTENT_LENGTH, "0");
+    request._headers.emplace(HTTP_SKIP_HEADER, "99999999999999999999");
+    request.set_handler(&action);
+    action.on_header(&request);
+    action.handle(&request);
+
+    rapidjson::Document doc;
+    doc.Parse(k_response_str.c_str());
+    ASSERT_STREQ("Fail", doc["Status"].GetString());
+    ASSERT_NE(nullptr, std::strstr(doc["Message"].GetString(), "skip_header"));
+}
+
+// Every numeric load header now goes through the same parser, so one table
+// covers them all: a value that is not a number, a value with trailing garbage
+// that std::sto* used to accept and silently truncate, a value too large for
+// int64_t, and a value outside the range the field itself allows.
+TEST_F(StreamLoadActionTest, numeric_headers_rejected) {
+    struct TestCase {
+        std::string header;
+        std::string value;
+        std::string expected_message;
+    };
+    TestCase test_cases[] = {
+            {HttpHeaders::CONTENT_LENGTH, "-1", "must be between 0 and"},
+            {HTTP_SKIP_HEADER, "not-a-number", "skip_header"},
+            {HTTP_SKIP_HEADER, "1abc", "skip_header"},
+            {HTTP_SKIP_HEADER, "-1", "skip_header must be equal or greater than 0"},
+            {HTTP_LOAD_MEM_LIMIT, "not-a-number", "load_mem_limit"},
+            {HTTP_LOAD_MEM_LIMIT, "99999999999999999999", "load_mem_limit"},
+            {HTTP_LOAD_MEM_LIMIT, "-1", "load_mem_limit must be equal or greater than 0"},
+            {HTTP_LOAD_DOP, "not-a-number", "load_dop"},
+            {HTTP_LOAD_DOP, "99999999999999999999", "load_dop"},
+            // load_dop is an i32 on the wire; a wider value used to be truncated.
+            {HTTP_LOAD_DOP, "2147483648", "must be between -2147483648 and 2147483647"},
+            {HTTP_LOAD_DOP, "-2147483649", "must be between -2147483648 and 2147483647"},
+            {HTTP_LOG_REJECTED_RECORD_NUM, "not-a-number", "log_rejected_record_num"},
+            {HTTP_LOG_REJECTED_RECORD_NUM, "99999999999999999999", "log_rejected_record_num"},
+            {HTTP_LOG_REJECTED_RECORD_NUM, "-2", "log_rejected_record_num must be equal or greater than -1"},
+            {HTTP_EXEC_MEM_LIMIT, "not-a-number", "exec_mem_limit"},
+            {HTTP_EXEC_MEM_LIMIT, "99999999999999999999", "exec_mem_limit"},
+            {HTTP_EXEC_MEM_LIMIT, "0", "exec_mem_limit must be greater than 0"},
+    };
+
+    for (const auto& tc : test_cases) {
+        k_response_str = "";
+        StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                                _batch_write_mgr.get());
+
+        HttpRequest request(_evhttp_req);
+        request._params.emplace(HTTP_DB_KEY, "db");
+        request._params.emplace(HTTP_TABLE_KEY, "tbl");
+        request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
+        if (tc.header != HttpHeaders::CONTENT_LENGTH) {
+            request._headers.emplace(HttpHeaders::CONTENT_LENGTH, "0");
+        }
+        request._headers.emplace(tc.header, tc.value);
+        request.set_handler(&action);
+        action.on_header(&request);
+        action.handle(&request);
+
+        rapidjson::Document doc;
+        doc.Parse(k_response_str.c_str());
+        ASSERT_STREQ("Fail", doc["Status"].GetString()) << tc.header << ": " << tc.value;
+        ASSERT_NE(nullptr, std::strstr(doc["Message"].GetString(), tc.expected_message.c_str()))
+                << tc.header << ": " << tc.value << " -> " << doc["Message"].GetString();
+    }
+}
+
+// The same headers with values the parser accepts must still reach the plan
+// request unchanged.
+TEST_F(StreamLoadActionTest, numeric_headers_accepted) {
+    StreamLoadAction action(&_env, &_stream_load_orchestrator, _stream_load_executor.get(), _limiter.get(),
+                            _batch_write_mgr.get());
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("StreamLoadAction::_process_put::rpc_timeout");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+
+    TStreamLoadPutRequest captured;
+    SyncPoint::GetInstance()->SetCallBack("StreamLoadAction::_process_put::rpc_timeout",
+                                          [&](void* arg) { captured = *static_cast<TStreamLoadPutRequest*>(arg); });
+
+    HttpRequest request(_evhttp_req);
+    request._params.emplace(HTTP_DB_KEY, "db");
+    request._params.emplace(HTTP_TABLE_KEY, "tbl");
+    request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
+    request._headers.emplace(HttpHeaders::CONTENT_LENGTH, "6");
+    request._headers.emplace(HTTP_SKIP_HEADER, "2");
+    request._headers.emplace(HTTP_LOAD_MEM_LIMIT, "1048576");
+    request._headers.emplace(HTTP_LOAD_DOP, "4");
+    request._headers.emplace(HTTP_LOG_REJECTED_RECORD_NUM, "-1");
+    request._headers.emplace(HTTP_EXEC_MEM_LIMIT, "2097152");
+    request.set_handler(&action);
+    ASSERT_EQ(0, action.on_header(&request));
+
+    EXPECT_EQ(2, captured.skipHeader);
+    EXPECT_EQ(1048576, captured.loadMemLimit);
+    EXPECT_EQ(4, captured.load_dop);
+    EXPECT_EQ(-1, captured.log_rejected_record_num);
+
+    auto* ctx = static_cast<StreamLoadContext*>(request._handler_ctx);
+    ASSERT_NE(nullptr, ctx);
+    EXPECT_EQ(6, ctx->body_bytes);
+    EXPECT_EQ(2097152, ctx->put_result.params.query_options.mem_limit);
 }
 
 } // namespace starrocks

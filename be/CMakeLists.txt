@@ -192,6 +192,7 @@ option(WITH_STARCACHE "Build binary with starcache library" ${WITH_STARCACHE_DEF
 option(WITH_BRCP_KEEPALIVE "Build binary with brpc_socket_keepalive (requires brpc 1.8)" OFF)
 
 option(WITH_BENCH "Build binary with bench" OFF)
+option(WITH_GLIBC_COMPAT "Build starrocks_be with the glibc compatibility shim, so it runs on hosts with an older glibc than the build image's" OFF)
 option(WITH_CONNECTOR_BENCHMARK "Build the benchgen-backed benchmark connector" ON)
 option(WITH_CONNECTOR_ELASTICSEARCH "Build the Elasticsearch connector" ON)
 option(WITH_CONNECTOR_JDBC "Build the JDBC connector" ON)
@@ -207,7 +208,12 @@ option(USE_AVX2 "Build with AVX2 instruction" ON)
 
 option(USE_AVX512 "Build with AVX512f/AVX512BW instruction" OFF)
 
+option(USE_ARM_CRC32 "Build with ARM CRC32 instruction" ON)
+
 option(WITH_TENANN "Build with TENANN" OFF)
+
+option(WITH_PAIMON_CPP "Build with paimon-cpp" ON)
+option(WITH_H3 "Enable native H3 functions" ON)
 
 option(WITH_RELATIVE_SRC_PATH "Build source file with relative path" ON)
 
@@ -224,6 +230,12 @@ message(STATUS "WITH TENANN is: ${WITH_TENANN}")
 if (APPLE AND WITH_STARCACHE)
     message(STATUS "Disable starcache on macOS")
     set(WITH_STARCACHE OFF CACHE BOOL "Build binary with starcache library" FORCE)
+endif()
+
+# thirdparty does not build paimon-cpp on macOS.
+if (APPLE AND WITH_PAIMON_CPP)
+    message(STATUS "Disable paimon-cpp on macOS")
+    set(WITH_PAIMON_CPP OFF CACHE BOOL "Build with paimon-cpp" FORCE)
 endif()
 
 # Check gcc
@@ -361,6 +373,10 @@ endif()
 if (${WITH_STARCACHE} STREQUAL "ON")
     set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DWITH_STARCACHE")
 endif()
+if (WITH_H3)
+    set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DWITH_H3")
+    set(H3_LIBRARIES h3)
+endif()
 
 # When LLVM is used, should give GCC_HOME to get c++11 header to use new string and list
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -388,7 +404,11 @@ if ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86" OR "${CMAKE_BUILD_TARGET_ARCH}" 
         set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -mavx512f -mavx512bw -mavx512dq -mavx512cd -mavx512vl")
     endif()
 elseif ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "aarch64")
-    set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -march=armv8-a+crc")
+    if (${USE_ARM_CRC32})
+        set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -march=armv8-a+crc")
+    else()
+        set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -march=armv8-a")
+    endif()
 endif()
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS}  -Wno-attributes -DS2_USE_GFLAGS -DS2_USE_GLOG")
 
@@ -540,6 +560,30 @@ endif()
 
 include(${SRC_DIR}/exprs_ext/extension_targets.cmake)
 
+# Concrete connectors reach the BE binary only as transitive PRIVATE deps of
+# ModuleBootstrap/Exec, which CMake places after the thirdparty group. List every
+# connector ModuleBootstrap pulls (guarded by the same options) ahead of it.
+set (DIRECT_CONNECTOR_LINK_LIBS
+    Connector
+    ConnectorLake
+    ConnectorFile
+    ConnectorHive
+    ConnectorIceberg
+    ConnectorCacheStats
+)
+if (WITH_CONNECTOR_BENCHMARK)
+    list(APPEND DIRECT_CONNECTOR_LINK_LIBS ConnectorBenchmark)
+endif()
+if (WITH_CONNECTOR_ELASTICSEARCH)
+    list(APPEND DIRECT_CONNECTOR_LINK_LIBS ConnectorElasticsearch)
+endif()
+if (WITH_CONNECTOR_JDBC)
+    list(APPEND DIRECT_CONNECTOR_LINK_LIBS ConnectorJDBC)
+endif()
+if (WITH_CONNECTOR_MYSQL)
+    list(APPEND DIRECT_CONNECTOR_LINK_LIBS ConnectorMySQL)
+endif()
+
 # Set starrocks libraries
 set(STARROCKS_LINK_LIBS
     HttpService
@@ -550,13 +594,24 @@ set(STARROCKS_LINK_LIBS
     Orchestration
     DataWorkflows
     ${WL_START_GROUP}
-    Connector
-    ConnectorFile
-    # Legacy connector registration pulls concrete connector objects that
-    # depend on Exec symbols, so keep it in the static library group.
-    ConnectorBuiltinRegistry
     Exec
     ${WL_WHOLE_ARCHIVE_PREFIX} ${EXPR_EXTENSION_LIBS} ${WL_WHOLE_ARCHIVE_SUFFIX}
+    ${WL_END_GROUP}
+    # Concrete data sinks are PRIVATE dependencies of Exec. Keep them in the
+    # main link list ahead of connectors, Storage, format, and thirdparty
+    # provider archives so one-pass static linkers see their unresolved
+    # references first.
+    DataSinkResult
+    DataSinkExchange
+    DataSinkExternal
+    DataSinkDictionaryCache
+    DataSinkTablet
+    DataSinkFile
+    # ConnectorLake depends on Storage, while connectors also depend on the
+    # format libs and thirdparty archives below; keep them ahead of those
+    # dependencies.
+    ${WL_START_GROUP}
+    ${DIRECT_CONNECTOR_LINK_LIBS}
     ${WL_END_GROUP}
     Storage
     # The concrete format libraries must be linked ahead of the thirdparty
@@ -621,6 +676,7 @@ set(STARROCKS_DEPENDENCIES
     clucene-contribs-lib
     rocksdb
     libs2
+    ${H3_LIBRARIES}
     snappy
     ${Boost_LIBRARIES}
     thrift
@@ -725,9 +781,13 @@ if ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86" OR "${CMAKE_BUILD_TARGET_ARCH}" 
     set(STARROCKS_DEPENDENCIES
         ${STARROCKS_DEPENDENCIES}
         breakpad
-        libdeflate
     )
 endif()
+
+set(STARROCKS_DEPENDENCIES
+    ${STARROCKS_DEPENDENCIES}
+    libdeflate
+)
 
 if (${WITH_TENANN} STREQUAL "ON")
     set(STARROCKS_DEPENDENCIES
@@ -887,15 +947,29 @@ endif()
 set (TEST_LINK_LIBS
     Orchestration
     ${STARROCKS_LINK_LIBS}
-    ConnectorBuiltinRegistry
     TestUtil
     ${WL_START_GROUP}
+    ${DIRECT_CONNECTOR_LINK_LIBS}
     gmock
     gtest
     ${WL_END_GROUP}
 )
 
-set (BENCH_LINK_LIBS ${STARROCKS_LINK_LIBS})
+# Several benches assert with gtest macros, so benchmarks need gtest just like tests do.
+set (BENCH_LINK_LIBS
+    ${STARROCKS_LINK_LIBS}
+    ${WL_START_GROUP}
+    ${DIRECT_CONNECTOR_LINK_LIBS}
+    gtest
+    ${WL_END_GROUP}
+)
+
+# arrow_testing is Arrow's test-support library: its gtest_util.cc references GoogleTest, which only
+# TEST_LINK_LIBS and BENCH_LINK_LIBS carry. On the production link it leaves starrocks_be with
+# undefined testing::* symbols. Test targets are unaffected because they link gtest, so only a
+# release build shows it. Removed here, after TEST_LINK_LIBS and BENCH_LINK_LIBS have been built
+# from STARROCKS_LINK_LIBS, so only the production link loses it.
+list(REMOVE_ITEM STARROCKS_LINK_LIBS arrow_testing)
 
 # Only build static libs
 set(BUILD_SHARED_LIBS OFF)
@@ -985,7 +1059,9 @@ add_subdirectory(${SRC_DIR}/exec_primitive)
 add_subdirectory(${SRC_DIR}/connector_primitive)
 add_subdirectory(${SRC_DIR}/connector)
 add_subdirectory(${SRC_DIR}/module)
+add_subdirectory(${SRC_DIR}/data_sink)
 add_subdirectory(${SRC_DIR}/exec)
+add_subdirectory(${SRC_DIR}/schema_scanner)
 add_subdirectory(${SRC_DIR}/exprs)
 add_subdirectory(${SRC_DIR}/gen_cpp)
 add_subdirectory(${SRC_DIR}/geo)

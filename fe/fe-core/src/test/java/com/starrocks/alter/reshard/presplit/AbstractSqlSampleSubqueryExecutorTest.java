@@ -14,12 +14,21 @@
 
 package com.starrocks.alter.reshard.presplit;
 
+import com.google.common.collect.Lists;
+import com.starrocks.catalog.Column;
+import com.starrocks.catalog.Variant;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SessionVariable;
+import com.starrocks.type.VarcharType;
 import com.starrocks.warehouse.cngroup.ComputeResource;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
+import java.util.List;
+
+import static com.starrocks.alter.reshard.presplit.PresplitTestSupport.bigintColumn;
+import static com.starrocks.alter.reshard.presplit.PresplitTestSupport.jsonResultBatch;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -54,6 +63,29 @@ class AbstractSqlSampleSubqueryExecutorTest {
         inOrder.verify(sessionVariable).setQueryTimeoutS(137);
     }
 
+    /**
+     * The sample sub-query must read the BASE index, not a sibling rollup. Both async and sync
+     * MV/rollup rewrite must be disabled, and (like the timeout) applied AFTER the warehouse switch that
+     * re-clones the session variable — otherwise a coarser sibling rollup could be sampled once the
+     * table carries rollups, skewing the tablet boundaries.
+     */
+    @Test
+    void materializedViewRewriteDisabledAfterWarehouseSwitchSoItSurvives() {
+        ConnectContext context = mock(ConnectContext.class);
+        SessionVariable sessionVariable = mock(SessionVariable.class);
+        when(context.getSessionVariable()).thenReturn(sessionVariable);
+        ComputeResource computeResource = mock(ComputeResource.class);
+        when(computeResource.getWarehouseId()).thenReturn(9L);
+
+        AbstractSqlSampleSubqueryExecutor.configureSampleContext(
+                context, computeResource, /*queryTimeoutSeconds=*/ 0);
+
+        InOrder inOrder = inOrder(context, sessionVariable);
+        inOrder.verify(context).setCurrentWarehouseId(9L);
+        inOrder.verify(sessionVariable).setEnableMaterializedViewRewrite(false);
+        inOrder.verify(sessionVariable).setEnableSyncMaterializedViewRewrite(false);
+    }
+
     @Test
     void nonPositiveQueryTimeoutLeavesSessionTimeoutUntouched() {
         ConnectContext context = mock(ConnectContext.class);
@@ -67,5 +99,184 @@ class AbstractSqlSampleSubqueryExecutorTest {
 
         verify(context).setCurrentWarehouseId(7L);
         verify(sessionVariable, never()).setQueryTimeoutS(anyInt());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Secondary-index (multi-index) projection + decode tests. Driven through
+    // InternalPartitionSampleSubqueryExecutor -- a concrete AbstractSqlSampleSubqueryExecutor
+    // subclass in this package -- since these seams (buildSampleSql's secondary slice,
+    // decodeRow's cumulative-arity secondary decode) are shared scaffolding exercised
+    // via execute(), not overridden per subclass.
+    // ---------------------------------------------------------------------------
+
+    @Test
+    void projectsSecondaryIndexColumns() throws Exception {
+        StringBuilder capturedSql = new StringBuilder();
+        InternalPartitionSampleSubqueryExecutor executor = new InternalPartitionSampleSubqueryExecutor(
+                (sql, computeResource, ignoredTimeout) -> {
+                    capturedSql.append(sql);
+                    return List.of();
+                });
+        SecondaryIndexSpec rollupOne = new SecondaryIndexSpec(101L, List.of(bigintColumn("r1")));
+        SecondaryIndexSpec rollupTwo = new SecondaryIndexSpec(102L, List.of(bigintColumn("r2a"), bigintColumn("r2b")));
+
+        executor.execute(partitionRequest("db", "tbl", "p1",
+                List.of("k"), List.of(rollupOne, rollupTwo), List.of("dt"), 0L,
+                List.of(bigintColumn("k")), List.of(bigintColumn("dt"))));
+
+        Assertions.assertTrue(capturedSql.toString().contains("SELECT `k`, `r1`, `r2a`, `r2b`, `dt` FROM"),
+                "projection must be sort-key, then each secondary spec's sort key in spec order, "
+                        + "then partition-source: " + capturedSql);
+    }
+
+    @Test
+    void decodesSecondaryTuplesTaggedByMetaId() throws Exception {
+        InternalPartitionSampleSubqueryExecutor executor = new InternalPartitionSampleSubqueryExecutor(
+                (sql, computeResource, ignoredTimeout) -> List.of(
+                        jsonResultBatch("{\"data\":[\"1\", \"10\", \"20\", \"21\", \"99\"]}")));
+        SecondaryIndexSpec rollupOne = new SecondaryIndexSpec(101L, List.of(bigintColumn("r1")));
+        SecondaryIndexSpec rollupTwo = new SecondaryIndexSpec(102L, List.of(bigintColumn("r2a"), bigintColumn("r2b")));
+
+        SampleSubqueryExecutor.SampleExecution execution = executor.execute(partitionRequest(
+                "db", "tbl", "p1", List.of("k"), List.of(rollupOne, rollupTwo), List.of("dt"), 0L,
+                List.of(bigintColumn("k")), List.of(bigintColumn("dt"))));
+
+        List<SampleRow> rows = Lists.newArrayList(execution.rows());
+        Assertions.assertEquals(1, rows.size());
+        SampleRow row = rows.get(0);
+        Assertions.assertEquals("1", row.sortKeyTuple().get(0).getStringValue());
+        Assertions.assertEquals("99", row.partitionSourceTuple().get(0).getStringValue());
+        Assertions.assertEquals(2, row.secondaryIndexTuples().size());
+        Assertions.assertEquals(101L, row.secondaryIndexTuples().get(0).indexMetaId());
+        Assertions.assertEquals(1, row.secondaryIndexTuples().get(0).values().size());
+        Assertions.assertEquals("10", row.secondaryIndexTuples().get(0).values().get(0).getStringValue());
+        Assertions.assertEquals(102L, row.secondaryIndexTuples().get(1).indexMetaId());
+        Assertions.assertEquals(2, row.secondaryIndexTuples().get(1).values().size());
+        Assertions.assertEquals("20", row.secondaryIndexTuples().get(1).values().get(0).getStringValue());
+        Assertions.assertEquals("21", row.secondaryIndexTuples().get(1).values().get(1).getStringValue());
+    }
+
+    @Test
+    void emptySecondaryProjectionAndDecodeUnchanged() throws Exception {
+        StringBuilder capturedSql = new StringBuilder();
+        InternalPartitionSampleSubqueryExecutor executor = new InternalPartitionSampleSubqueryExecutor(
+                (sql, computeResource, ignoredTimeout) -> {
+                    capturedSql.append(sql);
+                    return List.of(jsonResultBatch("{\"data\":[\"10\", \"20\"]}"));
+                });
+
+        SampleSubqueryExecutor.SampleExecution execution = executor.execute(partitionRequest(
+                "db", "tbl", "p1", List.of("k"), List.of(), List.of("dt"), 0L,
+                List.of(bigintColumn("k")), List.of(bigintColumn("dt"))));
+
+        Assertions.assertTrue(capturedSql.toString().contains("SELECT `k`, `dt` FROM"),
+                "empty secondary specs must not alter the projection: " + capturedSql);
+        List<SampleRow> rows = Lists.newArrayList(execution.rows());
+        Assertions.assertEquals(1, rows.size());
+        Assertions.assertTrue(rows.get(0).secondaryIndexTuples().isEmpty(),
+                "no secondary specs -> empty secondaryIndexTuples, never null");
+        Assertions.assertEquals("10", rows.get(0).sortKeyTuple().get(0).getStringValue());
+        Assertions.assertEquals("20", rows.get(0).partitionSourceTuple().get(0).getStringValue());
+    }
+
+    private static SampleRequest partitionRequest(
+            String dbName,
+            String tableName,
+            String partitionName,
+            List<String> sortKeySourceColumnNames,
+            List<SecondaryIndexSpec> secondaryIndexSortKeys,
+            List<String> partitionSourceColumnNames,
+            long partitionSizeBytes,
+            List<Column> sortKeyColumns,
+            List<Column> partitionSourceColumns) {
+        ComputeResource computeResource = mock(ComputeResource.class);
+        InternalPartitionScanContext scanContext = new InternalPartitionScanContext(
+                dbName, tableName, partitionName,
+                sortKeySourceColumnNames, partitionSourceColumnNames,
+                partitionSizeBytes, computeResource);
+        return new SampleRequest(
+                scanContext, sortKeyColumns, secondaryIndexSortKeys, partitionSourceColumns,
+                /*sampleByteLimit=*/ Long.MAX_VALUE, /*seed=*/ 0L);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Scanned-bytes-drive-the-rate / Estimates-keep-the-total tests.
+    // ---------------------------------------------------------------------------
+
+    @Test
+    void partitionProjectionReusesAnIdentifierCaseInsensitivelyButAnExpressionOnlyExactly() {
+        // Column names are case-insensitive, so `k` reuses `K`; a string literal is data, so
+        // concat('A', r) must get its own cell rather than read concat('a', r)'s value.
+        String sql = AbstractSqlSampleSubqueryExecutor.buildSampleSql("t", null,
+                List.of("`K`", "CAST(concat('a', `r`) AS varchar(8))"),
+                List.of("`k`", "CAST(concat('A', `r`) AS varchar(8))", "CAST(concat('a', `r`) AS varchar(8))"),
+                1.0, 10, 0L);
+
+        Assertions.assertTrue(sql.startsWith("SELECT `K`, CAST(concat('a', `r`) AS varchar(8)), "
+                + "CAST(concat('A', `r`) AS varchar(8)) FROM t WHERE"), sql);
+    }
+
+    @Test
+    void longQuotedIdentifierCanBeReusedWithoutRegexRecursion() {
+        String lower = "`" + "a".repeat(20_000) + "``b`";
+        String upper = "`" + "A".repeat(20_000) + "``B`";
+
+        String sql = AbstractSqlSampleSubqueryExecutor.buildSampleSql("t", null,
+                List.of(lower), List.of(upper), 1.0, 10, 0L);
+
+        Assertions.assertTrue(sql.startsWith("SELECT " + lower + " FROM t WHERE"));
+    }
+
+    @Test
+    void samplingRateFollowsTheScannedBytesWhileEstimatesKeepTheWholeInput() throws Exception {
+        long totalBytes = 100L << 30;
+        long scannedBytes = 1L << 30;
+        List<Estimates.PartitionSourceBytes> breakdown = List.of(new Estimates.PartitionSourceBytes(
+                List.of(Variant.of(VarcharType.VARCHAR, "a")), totalBytes));
+        StringBuilder capturedSql = new StringBuilder();
+        AbstractSqlSampleSubqueryExecutor executor = fixedSpecExecutor(
+                new AbstractSqlSampleSubqueryExecutor.SampleSpec("t", null, totalBytes, mock(ComputeResource.class),
+                        List.of("`k`"), List.of(), List.of(bigintColumn("k")), List.of(), 0L, false,
+                        scannedBytes, breakdown),
+                capturedSql);
+
+        SampleSubqueryExecutor.SampleExecution execution = executor.execute(new SampleRequest(
+                PresplitTestSupport.DUMMY_CONTEXT, List.of(bigintColumn("k")), Long.MAX_VALUE, 0L));
+
+        Assertions.assertTrue(capturedSql.toString().contains("rand(0) < "
+                        + AbstractSqlSampleSubqueryExecutor.pickSamplingRate(scannedBytes) + " ORDER BY"),
+                "the rate targets the bytes the sample reads: " + capturedSql);
+        Assertions.assertEquals(totalBytes, execution.estimates().totalBytes(), "tablet sizing sees every file");
+        Assertions.assertEquals(breakdown, execution.estimates().partitionSourceBytes());
+    }
+
+    @Test
+    void existingSpecConstructorsScanTheWholeInput() {
+        AbstractSqlSampleSubqueryExecutor.SampleSpec spec = new AbstractSqlSampleSubqueryExecutor.SampleSpec(
+                "t", null, 42L, mock(ComputeResource.class), List.of("`k`"), List.of(),
+                List.of(bigintColumn("k")), List.of());
+
+        Assertions.assertEquals(42L, spec.scannedInputBytes());
+        Assertions.assertTrue(spec.partitionSourceBytes().isEmpty());
+    }
+
+    @Test
+    void theFilteredInputEstimateCannotBeCombinedWithAFileSubset() {
+        Assertions.assertThrows(IllegalArgumentException.class, () -> new AbstractSqlSampleSubqueryExecutor.SampleSpec(
+                "t", "k > 1", 100L, mock(ComputeResource.class), List.of("`k`"), List.of(),
+                List.of(bigintColumn("k")), List.of(), 10L, true, 50L, List.of()));
+    }
+
+    private static AbstractSqlSampleSubqueryExecutor fixedSpecExecutor(
+            AbstractSqlSampleSubqueryExecutor.SampleSpec spec, StringBuilder capturedSql) {
+        return new AbstractSqlSampleSubqueryExecutor("test ", (sql, computeResource, ignoredTimeout) -> {
+            capturedSql.append(sql);
+            return List.of();
+        }) {
+            @Override
+            protected SampleSpec resolveSampleSpec(SampleRequest request) {
+                return spec;
+            }
+        };
     }
 }

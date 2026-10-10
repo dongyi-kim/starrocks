@@ -20,6 +20,7 @@ import com.starrocks.catalog.Database;
 import com.starrocks.catalog.IcebergTable;
 import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.common.jmockit.Deencapsulation;
+import com.starrocks.common.util.LogUtil;
 import com.starrocks.connector.ConnectorMetadataRequestContext;
 import com.starrocks.connector.exception.StarRocksConnectorException;
 import com.starrocks.connector.iceberg.CachingIcebergCatalog.IcebergTableName;
@@ -298,7 +299,7 @@ public class CachingIcebergCatalogTest {
                 () -> cachingIcebergCatalog.getTable(connectContext, "test", "table"));
         String expectedPrefix = "Failed to get iceberg table iceberg_catalog.test.table";
         Assertions.assertTrue(ex.getMessage().contains(expectedPrefix));
-        Assertions.assertTrue(ex.getMessage().contains("io failure"));
+        Assertions.assertTrue(LogUtil.getUnwoundExceptionMessage(ex).contains("io failure"));
     }
 
     private int getStaticIntField(String fieldName) {
@@ -582,6 +583,77 @@ public class CachingIcebergCatalogTest {
         Assertions.assertSame(cachedTable, catalog.getTable(ctx, "db1", "t1"));
         catalog.refreshTable("db1", "t1", ctx, executor);
         Assertions.assertSame(reloadedTable, tableCache.getIfPresent(key));
+    }
+
+    @Test
+    public void testRefreshTableDoesNotResurrectEntryInvalidatedDuringReload(@Mocked IcebergCatalog delegate) {
+        assertRefreshLeavesNoEntryAfterConcurrentChange(delegate, false, false);
+    }
+
+    @Test
+    public void testRefreshTableDoesNotResurrectEntryInvalidatedDuringReloadWhenMetadataUnchanged(
+            @Mocked IcebergCatalog delegate) {
+        assertRefreshLeavesNoEntryAfterConcurrentChange(delegate, true, false);
+    }
+
+    @Test
+    public void testRefreshTableInvalidatesEntryReplacedDuringReload(@Mocked IcebergCatalog delegate) {
+        assertRefreshLeavesNoEntryAfterConcurrentChange(delegate, false, true);
+    }
+
+    @Test
+    public void testRefreshTableInvalidatesEntryReplacedDuringReloadWhenMetadataUnchanged(
+            @Mocked IcebergCatalog delegate) {
+        assertRefreshLeavesNoEntryAfterConcurrentChange(delegate, true, true);
+    }
+
+    // While a refresh is still reloading the table from the remote catalog, the cache entry changes underneath it:
+    // either a commit on this FE invalidates it, or a concurrent load (e.g. a Caffeine refreshAfterWrite reload)
+    // replaces it. The refresh must not write its reloaded table back, and must leave no entry behind so the next
+    // access loads metadata at least as new as what the refresh saw.
+    private void assertRefreshLeavesNoEntryAfterConcurrentChange(IcebergCatalog delegate, boolean sameLocation,
+                                                                 boolean replaceEntry) {
+        ConnectContext ctx = new ConnectContext();
+        Table cachedTable = createBaseTableWithManifests(1, 1);
+        Table staleReloadedTable = createBaseTableWithManifests(1, 1);
+        if (sameLocation) {
+            String sharedLocation = "s3://bucket/metadata/v1.metadata.json";
+            Mockito.when(((BaseTable) cachedTable).operations().current().metadataFileLocation())
+                    .thenReturn(sharedLocation);
+            Mockito.when(((BaseTable) staleReloadedTable).operations().current().metadataFileLocation())
+                    .thenReturn(sharedLocation);
+        }
+
+        Table concurrentlyLoadedTable = createBaseTableWithManifests(1, 1);
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        CachingIcebergCatalog catalog = new CachingIcebergCatalog(CATALOG_NAME, delegate,
+                DEFAULT_CATALOG_PROPERTIES, executor);
+        LoadingCache<IcebergTableName, Table> tableCache = Deencapsulation.getField(catalog, "tables");
+        IcebergTableName key = new IcebergTableName("db1", "t1");
+        AtomicInteger calls = new AtomicInteger();
+        new Expectations() {
+            {
+                delegate.getTable((ConnectContext) any, "db1", "t1");
+                result = new Delegate<Table>() {
+                    Table get(ConnectContext c, String db, String tbl) {
+                        if (calls.getAndIncrement() == 0) {
+                            return cachedTable;
+                        }
+                        if (replaceEntry) {
+                            tableCache.put(key, concurrentlyLoadedTable);
+                        } else {
+                            catalog.invalidateTableCache("db1", "t1");
+                        }
+                        return staleReloadedTable;
+                    }
+                };
+            }
+        };
+
+        Assertions.assertSame(cachedTable, catalog.getTable(ctx, "db1", "t1"));
+        catalog.refreshTable("db1", "t1", ctx, executor);
+        Assertions.assertNull(tableCache.getIfPresent(key));
     }
 
     @Test

@@ -37,6 +37,7 @@ package com.starrocks.common;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.starrocks.authentication.SecurityIntegration;
+import com.starrocks.common.util.CredentialMask;
 import com.starrocks.common.util.DateUtils;
 import com.starrocks.common.util.Util;
 import com.starrocks.qe.ConnectContext;
@@ -94,6 +95,20 @@ public class ConfigBase {
          * @return an array of alias names
          */
         String[] aliases() default {};
+
+        /**
+         * Whether the value is a credential (password, secret key, token, ...). ADMIN SHOW FRONTEND CONFIG and
+         * the /variable page report a set value as {@link CredentialMask#LONG}; the field keeps the real value.
+         */
+        boolean sensitive() default false;
+    }
+
+    // An empty value stays empty, so the output still tells an unset credential from a set one.
+    static String maskIfSensitive(ConfField anno, String value) {
+        if (anno.sensitive() && !Strings.isNullOrEmpty(value)) {
+            return CredentialMask.LONG;
+        }
+        return value;
     }
 
     protected Properties props;
@@ -143,35 +158,38 @@ public class ConfigBase {
         HashMap<String, String> map = new HashMap<String, String>();
         Field[] fields = configFields;
         for (Field f : fields) {
-            if (f.getAnnotation(ConfField.class) == null) {
+            ConfField anno = f.getAnnotation(ConfField.class);
+            if (anno == null) {
                 continue;
             }
+            String value;
             if (f.getType().isArray()) {
                 switch (f.getType().getSimpleName()) {
                     case "short[]":
-                        map.put(f.getName(), Arrays.toString((short[]) f.get(null)));
+                        value = Arrays.toString((short[]) f.get(null));
                         break;
                     case "int[]":
-                        map.put(f.getName(), Arrays.toString((int[]) f.get(null)));
+                        value = Arrays.toString((int[]) f.get(null));
                         break;
                     case "long[]":
-                        map.put(f.getName(), Arrays.toString((long[]) f.get(null)));
+                        value = Arrays.toString((long[]) f.get(null));
                         break;
                     case "double[]":
-                        map.put(f.getName(), Arrays.toString((double[]) f.get(null)));
+                        value = Arrays.toString((double[]) f.get(null));
                         break;
                     case "boolean[]":
-                        map.put(f.getName(), Arrays.toString((boolean[]) f.get(null)));
+                        value = Arrays.toString((boolean[]) f.get(null));
                         break;
                     case "String[]":
-                        map.put(f.getName(), Arrays.toString((String[]) f.get(null)));
+                        value = Arrays.toString((String[]) f.get(null));
                         break;
                     default:
                         throw new InvalidConfException("unknown type: " + f.getType().getSimpleName());
                 }
             } else {
-                map.put(f.getName(), f.get(null).toString());
+                value = f.get(null).toString();
             }
+            map.put(f.getName(), maskIfSensitive(anno, value));
         }
         return map;
     }
@@ -262,11 +280,32 @@ public class ConfigBase {
                             + confVal);
                 }
                 break;
+            case "group_provider_http_connect_timeout_ms":
+            case "group_provider_http_read_timeout_ms":
+                // URLConnection reads 0 as "no timeout" - the unbounded read these exist to prevent - and
+                // rejects a negative value with an unchecked exception that would surface on the journal
+                // replay thread. Neither may reach the setter.
+                int timeoutMs = Integer.parseInt(confVal);
+                if (timeoutMs <= 0) {
+                    throw new InvalidConfException("'" + f.getName() + "' must be a positive number of " +
+                            "milliseconds, current value: " + confVal);
+                }
+                break;
             case "db_used_data_quota_update_interval_secs":
                 int intVal = Integer.parseInt(confVal);
                 if (intVal < 30) {
                     throw new InvalidConfException("'db_used_data_quota_update_interval_secs' configuration " +
                             "must be at least 30 seconds, current value: " + confVal);
+                }
+                break;
+            case "label_clean_interval_second":
+                // The value drives Daemon.run()'s Thread.sleep(): 0 spins the label cleaner and a
+                // negative value throws IllegalArgumentException, which escapes the daemon loop and
+                // kills the cleaner thread for good.
+                int labelCleanInterval = Integer.parseInt(confVal);
+                if (labelCleanInterval <= 0) {
+                    throw new InvalidConfException("'label_clean_interval_second' configuration " +
+                            "must be greater than 0, current value: " + confVal);
                 }
                 break;
             case "http_request_allow_private_in_allowlist":
@@ -281,6 +320,24 @@ public class ConfigBase {
                     throw new InvalidConfException(
                             "'http_request_ssl_verification_required' must be 'true' or 'false'. Current value: "
                                     + confVal);
+                }
+                break;
+            case "query_queue_slots_estimator_strategy":
+                if (!confVal.equalsIgnoreCase("PBE")
+                        && !confVal.equalsIgnoreCase("MBE")
+                        && !confVal.equalsIgnoreCase("CBE")
+                        && !confVal.equalsIgnoreCase("MAX")
+                        && !confVal.equalsIgnoreCase("MIN")) {
+                    throw new InvalidConfException("'query_queue_slots_estimator_strategy' must be one of PBE, "
+                            + "MBE, CBE, MAX, or MIN. Current value: " + confVal);
+                }
+                break;
+            case "default_mv_refresh_mode":
+                // Must accept exactly what PropertyAnalyzer#analyzeRefreshMode accepts for the
+                // refresh_mode property: AUTO is implemented but deliberately not selectable.
+                if (!confVal.equalsIgnoreCase("PCT") && !confVal.equalsIgnoreCase("INCREMENTAL")) {
+                    throw new InvalidConfException("'default_mv_refresh_mode' must be one of PCT or INCREMENTAL. "
+                            + "Current value: " + confVal);
                 }
                 break;
             case "http_request_security_level":
@@ -333,10 +390,19 @@ public class ConfigBase {
         }
     }
 
-    public static void setConfigField(Field f, String confVal) throws Exception {
+    private static class ParsedConfigValue {
+        private final String confVal;
+        private final Object parsedValue;
+
+        private ParsedConfigValue(String confVal, Object parsedValue) {
+            this.confVal = confVal;
+            this.parsedValue = parsedValue;
+        }
+    }
+
+    private static ParsedConfigValue parseAndValidateConfigField(Field f, String confVal) throws Exception {
         confVal = confVal.trim();
         boolean isEmpty = confVal.isEmpty();
-
         String[] sa = confVal.split(",");
         for (int i = 0; i < sa.length; i++) {
             sa[i] = sa[i].trim();
@@ -344,71 +410,89 @@ public class ConfigBase {
 
         validateConfValue(f, sa, confVal);
 
-        // set config field
+        Object parsedValue;
         switch (f.getType().getSimpleName()) {
             case "short":
-                f.setShort(null, Short.parseShort(confVal));
+                parsedValue = Short.parseShort(confVal);
                 break;
             case "int":
-                f.setInt(null, Integer.parseInt(confVal));
+                parsedValue = Integer.parseInt(confVal);
                 break;
             case "long":
-                f.setLong(null, Long.parseLong(confVal));
+                parsedValue = Long.parseLong(confVal);
                 break;
             case "double":
-                f.setDouble(null, Double.parseDouble(confVal));
+                parsedValue = Double.parseDouble(confVal);
                 break;
             case "boolean":
-                f.setBoolean(null, Boolean.parseBoolean(confVal));
+                parsedValue = Boolean.parseBoolean(confVal);
                 break;
             case "String":
-                f.set(null, confVal);
+                parsedValue = confVal;
                 break;
             case "short[]":
                 short[] sha = isEmpty ? new short[0] : new short[sa.length];
                 for (int i = 0; i < sha.length; i++) {
                     sha[i] = Short.parseShort(sa[i]);
                 }
-                f.set(null, sha);
+                parsedValue = sha;
                 break;
             case "int[]":
                 int[] ia = isEmpty ? new int[0] : new int[sa.length];
                 for (int i = 0; i < ia.length; i++) {
                     ia[i] = Integer.parseInt(sa[i]);
                 }
-                f.set(null, ia);
+                parsedValue = ia;
                 break;
             case "long[]":
                 long[] la = isEmpty ? new long[0] : new long[sa.length];
                 for (int i = 0; i < la.length; i++) {
                     la[i] = Long.parseLong(sa[i]);
                 }
-                f.set(null, la);
+                parsedValue = la;
                 break;
             case "double[]":
                 double[] da = isEmpty ? new double[0] : new double[sa.length];
                 for (int i = 0; i < da.length; i++) {
                     da[i] = Double.parseDouble(sa[i]);
                 }
-                f.set(null, da);
+                parsedValue = da;
                 break;
             case "boolean[]":
                 boolean[] ba = isEmpty ? new boolean[0] : new boolean[sa.length];
                 for (int i = 0; i < ba.length; i++) {
                     ba[i] = Boolean.parseBoolean(sa[i]);
                 }
-                f.set(null, ba);
+                parsedValue = ba;
                 break;
             case "String[]":
-                f.set(null, isEmpty ? new String[0] : sa);
+                parsedValue = isEmpty ? new String[0] : sa;
                 break;
             default:
                 throw new InvalidConfException("unknown type: " + f.getType().getSimpleName());
         }
+        return new ParsedConfigValue(confVal, parsedValue);
+    }
+
+    public static void setConfigField(Field f, String confVal) throws Exception {
+        ParsedConfigValue parsedConfigValue = parseAndValidateConfigField(f, confVal);
+        f.set(null, parsedConfigValue.parsedValue);
     }
 
     public static synchronized void setMutableConfig(String key, String value,
                                                      boolean isPersisted, String userIdentity) throws InvalidConfException {
+        Field field = allMutableConfigs.get(key);
+        if (field == null) {
+            throw new InvalidConfException(ErrorCode.ERROR_CONFIG_NOT_EXIST, key);
+        }
+
+        ParsedConfigValue parsedConfigValue;
+        try {
+            parsedConfigValue = parseAndValidateConfigField(field, value);
+        } catch (Exception e) {
+            throw new InvalidConfException("Failed to set config '" + key + "'. err: " + e.getMessage());
+        }
+
         if (isPersisted) {
             if (!ConfigBase.isIsPersisted()) {
                 String errMsg = "set persisted config failed, because current running mode is not persisted";
@@ -417,19 +501,14 @@ public class ConfigBase {
             }
 
             try {
-                appendPersistedProperties(key, value, userIdentity);
+                appendPersistedProperties(key, parsedConfigValue.confVal, userIdentity);
             } catch (IOException e) {
                 throw new InvalidConfException("Failed to set config '" + key + "'. err: " + e.getMessage());
             }
         }
 
-        Field field = allMutableConfigs.get(key);
-        if (field == null) {
-            throw new InvalidConfException(ErrorCode.ERROR_CONFIG_NOT_EXIST, key);
-        }
-
         try {
-            ConfigBase.setConfigField(field, value);
+            field.set(null, parsedConfigValue.parsedValue);
         } catch (Exception e) {
             throw new InvalidConfException("Failed to set config '" + key + "'. err: " + e.getMessage());
         }
@@ -548,7 +627,7 @@ public class ConfigBase {
 
             config.add(confKey);
             config.add(Arrays.toString(anno.aliases()));
-            config.add(Strings.nullToEmpty(confVal));
+            config.add(Strings.nullToEmpty(maskIfSensitive(anno, confVal)));
             config.add(f.getType().getSimpleName());
             config.add(String.valueOf(anno.mutable()));
             config.add(anno.comment());

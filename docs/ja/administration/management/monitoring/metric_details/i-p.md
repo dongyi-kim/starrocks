@@ -15,7 +15,7 @@ import MetricsIP from '../../../../_assets/commonMarkdown/metrics_i_p.mdx'
 - [非同期マテリアライズドビューのメトリクスに関するメトリクス](../metrics-materialized_view.md)
 - [共有データダッシュボードのメトリクス、およびスターレットダッシュボードのメトリクスに関するメトリクス](../metrics-shared-data.md)
 
-StarRocksクラスターの監視サービスを構築する方法の詳細については、以下を参照してください。[監視とアラート](../Monitor_and_Alert.md)。
+StarRocksクラスターの監視サービスを構築する方法の詳細については、以下を参照してください。[監視とアラート](../monitoring.md)。
 
 :::
 
@@ -55,37 +55,6 @@ StarRocksクラスターの監視サービスを構築する方法の詳細に�
 - タイプ: 累積
 - ラベル: `compaction_type` (`manual` または `auto`)
 - 説明: Icebergコンパクション (`rewrite_data_files`) タスクの総数。
-
-## `iceberg_delete_bytes`
-
-- 単位: バイト
-- 種類: 累積
-- ラベル: `delete_type` (`position` または `metadata`)
-- 説明: Iceberg `DELETE` タスクから削除された合計バイト数。`metadata` 削除の場合、これは削除されたデータファイルのサイズを表します。`position` 削除の場合、これは作成された位置削除ファイルのサイズを表します。
-
-## `iceberg_delete_duration_ms_total`
-
-- 単位: ミリ秒
-- タイプ: 累積
-- ラベル: `delete_type` (`position`または`metadata`)
-- 説明: Iceberg `DELETE` タスクの合計実行時間（ミリ秒）。各タスクの実行時間は、終了後に加算されます。`delete_type` は、2つの削除方法を区別します。
-
-## `iceberg_delete_rows`
-
-- 単位: 行
-- タイプ: 累積
-- ラベル: `delete_type` (`position` または `metadata`)
-- 説明: Iceberg `DELETE` タスクから削除された行の合計数。`metadata` 削除の場合、これは削除されたデータファイル内の行数を表します。`position` 削除の場合、これは作成された位置削除の数を表します。
-
-## `iceberg_delete_total`
-
-- 単位: カウント
-- タイプ: 累積
-- ラベル:
-  - `status` (`success` または `failed`)
-  - `reason` (`none`、`timeout`、`oom`、`access_denied`、`unknown`)
-  - `delete_type` (`position` または `metadata`)
-- 説明: Icebergテーブルをターゲットとする`DELETE`タスクの合計数。このメトリックは、各タスクの終了後、成功または失敗にかかわらず1ずつ増加します。`delete_type`は、2つの削除方法を区別します: `position` (位置削除ファイルを生成する) と `metadata` (メタデータレベルの削除)。
 
 ## `iceberg_merge_bytes`
 
@@ -245,6 +214,11 @@ StarRocksクラスターの監視サービスを構築する方法の詳細に�
 - 単位: バイト
 - 説明: アプリケーションによって割り当てられた合計バイト数。
 
+## `jemalloc_dirty_bytes`
+
+- 単位: バイト
+- 説明: 未使用のダーティページ内の合計バイト数。これらのページはまだ madvise によってオペレーティングシステムに返却されておらず、ページフォールトを発生させずに新しい割り当てに再利用できます。
+
 ## `jemalloc_mapped_bytes`
 
 - 単位: バイト
@@ -260,6 +234,11 @@ StarRocksクラスターの監視サービスを構築する方法の詳細に�
 - 単位: カウント
 - 説明: メタデータに使用される透過的ヒュージページの数。
 
+## `jemalloc_muzzy_bytes`
+
+- 単位: バイト
+- 説明: 未使用の muzzy ページ内の合計バイト数。muzzy はダーティページと保持（retained）ページの中間的な減衰状態で、ページは madvise（例: MADV_FREE）によって処理済みですが、アドレスマッピングはまだ保持されています。
+
 ## `jemalloc_resident_bytes`
 
 - 単位: バイト
@@ -274,6 +253,43 @@ StarRocksクラスターの監視サービスを構築する方法の詳細に�
 
 - 単位: バイト
 - 説明: JITコンパイルされた関数キャッシュによって使用されるメモリ。
+
+## `lake_compaction_held_segment_bytes`
+
+- 単位: バイト
+- タイプ: 瞬時値
+- 説明: 入力セグメントを保持する実行中の lake compaction タスクが現在ピン留めしているセグメントメタデータのサイズ（`lake_compaction_hold_input_segments` で制御）。メタデータキャッシュとは異なり、このメモリは LRU の管理下になく、保持しているタスクの終了時に解放されます。値が継続的に高い場合は、キャッシュのサイズ不足ではなく長時間実行中の compaction を示します。
+
+## `lake_compaction_failed`
+
+- 単位: 件数
+- 説明: 失敗したストレージ・コンピュート分離（lake）コンパクションジョブのカウンタ。
+
+## `lake_compaction_partial_success`
+
+- 単位: 件数
+- 説明: 部分的に成功したストレージ・コンピュート分離（lake）コンパクションジョブのカウンタ。
+
+## `lake_compaction_running`
+
+- 単位: 件数
+- 説明: 現在実行中のストレージ・コンピュート分離（lake）コンパクションジョブの数。
+
+## `lake_compaction_running_tasks`
+
+- 単位: 件数
+- 説明: 実行中のすべてのストレージ・コンピュート分離（lake）コンパクションジョブにわたって、現在コンパクション中の tablet 数。これはスケジューラが `lake_compaction_max_tasks` 設定で上限を設ける際に用いる単位と同じで、コンパクションジョブ（パーティションごとに 1 つ）を数える `lake_compaction_running` よりも細かい粒度です。1 つのジョブは tablet ごとに 1 つの tablet 単位タスクに分割されます。`is_leader` ラベルが付与されており、Follower FE は `is_leader="false"` で値 0 を出力するため、ダッシュボードでは `is_leader="true"` でフィルタしてください。
+
+## `lake_compaction_score_at_trigger`
+
+- 単位: スコア
+- タイプ: Gauge
+- 説明: 直近にストレージ・コンピュート分離（lake）コンパクションジョブを起動したパーティションのコンパクションスコア（整数に丸めた値）。値はそのパーティション内タブレットの *最大* スコア（`Quantiles.getMax()`）で、スケジューラがコンパクション対象パーティションを選ぶ判定基準と一致します。トリガごとに各パーティションで 1 回更新され、Gauge は最新の更新値を保持します。この Gauge は減衰しません。Leader FE では、コンパクションが実行されていないときは直近のトリガ値を保持します（0 にリセットされません）。この値はプロセスローカル（Leader 上のインメモリカウンターで、永続化されません）であるため、FE Leader のフェイルオーバー後、新しく昇格した Leader は 0 から開始し、最初のコンパクショントリガまで 0 を報告します——前の Leader の値は引き継ぎません。この指標を単独で参照するのではなく、`lake_compaction_running > 0` と組み合わせてアラートを設定してください。`is_leader` ラベルが付与されており、Follower FE は `is_leader="false"` を返し値は 0 になるため、ダッシュボードでは `is_leader="true"` でフィルタしてください。
+
+## `lake_compaction_success`
+
+- 単位: 件数
+- 説明: 成功したストレージ・コンピュート分離（lake）コンパクションジョブのカウンタ。
 
 ## `lake_vacuum_del_file_batch_size_minute`
 
@@ -313,6 +329,12 @@ StarRocksクラスターの監視サービスを構築する方法の詳細に�
 - 説明: RPCスレッドプールの現在のサイズ。これは、ルーチンロードとテーブル関数を介したロードの処理に使用されます。デフォルト値は10で、最大値は1000です。この値は、スレッドプールの使用状況に基づいて動的に調整されます。
 
 ## `local_column_pool_bytes (Deprecated)`
+
+## `low_cardinality_dict_cache_bytes`
+
+- 単位: バイト
+- タイプ: Gauge
+- 説明: この FE 上の低基数グローバル辞書キャッシュ（`CacheDictManager`）にキャッシュされている辞書データの合計バイト数。キャッシュによって正確に追跡され（サンプリングではありません）、シリアライズされた辞書データを数え、実際のヒープ使用量の下限となります。このキャッシュは `low_cardinality_dict_cache_max_bytes` 設定によってこのサイズで上限が設定されます。
 
 ## `max_disk_io_util_percent`
 
@@ -439,6 +461,12 @@ StarRocksクラスターの監視サービスを構築する方法の詳細に�
 - タイプ: サマリー
 - 説明: RPCリクエストとストリームロードパイプが利用可能になるのを待機する時間の合計レイテンシー。
 
+## `meta_replay_lag_second`
+
+- 単位: 秒
+- タイプ: Gauge
+- 説明: この FE が再生済みのメタデータが、Leader の時刻からどれだけ遅れているか。Leader FE は 10 秒ごとにタイムスタンプをジャーナルに書き込んでおり、この項目はこのノードが再生した最新のタイムスタンプの経過時間です。`max_journal_replay_lag` は Leader のみが報告しますが、この項目は遅延しているノード自身が報告し、1 件のジャーナルの再生が滞っている間も増加し続けます。Leader FE はタイムスタンプを再生せず書き込む側であるため、常に `0` を報告します。この値が `meta_delay_toleration_second` を超えると、そのノードは自身のメタデータでの読み取り提供を停止し、クエリを Leader に転送します。ただし例外が 2 つあります。1 つは `ignore_meta_check` が `true` の場合で、このときは読み取りの提供を続けます。もう 1 つは、前回のチェック以降ジャーナルを 1 件も再生しておらず、かつ Leader との接続が保たれている場合です。このときそのノードは現在の読み取り提供状態をそのまま維持します。Leader が何も書き込んでいなければ、その時刻から遅れていること自体はこのノードの状態を表さないためです。この 2 つ目のケースはノードをサービスから外さないだけであり、すでに読み取りの提供を停止しているノードを復帰させるものではありません。
+
 ## `meta_request_duration`
 
 - 単位: us
@@ -548,7 +576,7 @@ StarRocksクラスターの監視サービスを構築する方法の詳細に�
 
 - タイプ: カウンター
 - 単位: カウント
-- 説明: レイクプライマリキー永続インデックスにおけるSSTファイル読み取り失敗の総数。SSTマルチゲット（読み取り）操作が失敗した場合に増加します。
+- 説明: レイクプライマリキー永続インデックスにおけるSSTファイル読み取り失敗の総数。SSTマルチゲット（読み取り）操作が失敗した場合、または Compaction が入力SSTファイルの読み取り中にデータ破損を検出した場合に増加します。
 
 ## `pk_index_sst_write_error_total`
 

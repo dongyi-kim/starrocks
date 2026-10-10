@@ -27,24 +27,27 @@
 #include "cache/disk_cache/test_cache_utils.h"
 #include "cache/mem_cache/lrucache_engine.h"
 #include "cache/scan/shared_buffered_input_stream.h"
+#include "column/array_column.h"
 #include "column/column_access_path.h"
 #include "column/column_helper.h"
 #include "column/fixed_length_column.h"
 #include "column/nullable_column.h"
 #include "column/struct_column.h"
+#include "column/variant_column.h"
 #include "common/config_exec_fwd.h"
 #include "common/config_scan_io_fwd.h"
 #include "common/logging.h"
 #include "common/util/thrift_util.h"
 #include "compute_env/global_dict/fragment_dict_state.h"
 #include "compute_env/runtime_range_pruner.hpp"
-#include "exec/hdfs_scanner/hdfs_scanner.h"
+#include "connector/hive/scanner/hdfs_scanner.h"
 #include "exec_primitive/runtime_filter/runtime_filter_helper.h"
 #include "exprs/binary_predicate.h"
 #include "exprs/expr_context.h"
 #include "exprs/expr_executor.h"
 #include "exprs/expr_factory.h"
 #include "exprs/in_const_predicate.hpp"
+#include "exprs/variant_path_reader.h"
 #include "formats/parquet/column_chunk_reader.h"
 #include "formats/parquet/column_materializer.h"
 #include "formats/parquet/metadata.h"
@@ -94,6 +97,15 @@ protected:
     using Int32RF = ComposedRuntimeBloomFilter<TYPE_INT>;
 
     StatusOr<RuntimeFilterProbeDescriptor*> gen_runtime_filter_desc(SlotId slot_id);
+    StatusOr<RuntimeFilterProbeDescriptor*> gen_runtime_filter_desc(SlotId slot_id, int32_t filter_id);
+
+    // Wires runtime filter predicates the way HdfsScanner::_build_scanner_context does.
+    // No ScanConjunctsManager is needed: a predicate only needs its descriptor and the
+    // probe slot id, since ConnectorPredicateParser::column_id() returns the slot id.
+    void _setup_rf_predicates(HdfsScannerContext* ctx,
+                              const std::vector<std::pair<RuntimeFilterProbeDescriptor*, SlotId>>& probes);
+    // Reads the reader to exhaustion, returning every value of the first INT column.
+    StatusOr<std::vector<int32_t>> _read_all_int_col0(const std::shared_ptr<FileReader>& file_reader);
 
     std::unique_ptr<RandomAccessFile> _create_file(const std::string& file_path);
     DataCacheOptions _mock_datacache_options();
@@ -348,7 +360,6 @@ protected:
     std::string _filter_row_group_path_3 =
             "./be/test/formats/parquet/test_data/file_read_test_filter_row_group_update_rf.parquet";
 
-    std::shared_ptr<RowDescriptor> _row_desc = nullptr;
     RuntimeState* _runtime_state = nullptr;
     std::unique_ptr<FragmentDictState> _fragment_dict_state;
     ObjectPool _pool;
@@ -389,8 +400,36 @@ protected:
 };
 
 StatusOr<RuntimeFilterProbeDescriptor*> FileReaderTest::gen_runtime_filter_desc(SlotId slot_id) {
+    return gen_runtime_filter_desc(slot_id, 1);
+}
+
+void FileReaderTest::_setup_rf_predicates(HdfsScannerContext* ctx,
+                                          const std::vector<std::pair<RuntimeFilterProbeDescriptor*, SlotId>>& probes) {
+    ctx->predicates.runtime_filter_preds = RuntimeFilterPredicates(0 /*driver_sequence*/);
+    for (const auto& [desc, slot_id] : probes) {
+        ctx->predicates.runtime_filter_preds.add_predicate(_pool.add(new RuntimeFilterPredicate(desc, slot_id)));
+    }
+    ctx->format_scan_context.runtime_filter_preds = &ctx->predicates.runtime_filter_preds;
+    ctx->format_scan_context.driver_sequence = 0;
+}
+
+StatusOr<std::vector<int32_t>> FileReaderTest::_read_all_int_col0(const std::shared_ptr<FileReader>& file_reader) {
+    std::vector<int32_t> values;
+    while (true) {
+        auto chunk = _create_int_chunk();
+        Status st = file_reader->get_next(&chunk);
+        if (st.is_end_of_file()) break;
+        RETURN_IF_ERROR(st);
+        const Column* col = ColumnHelper::get_data_column(chunk->get_column_by_index(0).get());
+        const auto& data = down_cast<const Int32Column*>(col)->get_data();
+        values.insert(values.end(), data.begin(), data.end());
+    }
+    return values;
+}
+
+StatusOr<RuntimeFilterProbeDescriptor*> FileReaderTest::gen_runtime_filter_desc(SlotId slot_id, int32_t filter_id) {
     TRuntimeFilterDescription tRuntimeFilterDescription;
-    tRuntimeFilterDescription.__set_filter_id(1);
+    tRuntimeFilterDescription.__set_filter_id(filter_id);
     tRuntimeFilterDescription.__set_has_remote_targets(false);
     tRuntimeFilterDescription.__set_build_plan_node_id(1);
     tRuntimeFilterDescription.__set_build_join_mode(TRuntimeFilterBuildJoinMode::BROADCAST);
@@ -2269,7 +2308,13 @@ TEST_F(FileReaderTest, TestComplexTypeNotNull) {
     EXPECT_EQ(262144, total_row_nums);
 }
 
-// Illegal parquet files, not support it anymore
+// Legacy two-level nested list written by Hudi (parquet-avro):
+//   optional group c (LIST) {
+//     repeated group array (LIST) {
+//       repeated int32 array;
+//     }
+//   }
+// The single repeated child makes it a nested list, not a list of struct<array>.
 TEST_F(FileReaderTest, TestHudiMORTwoNestedLevelArray) {
     // format:
     // b: varchar
@@ -2288,7 +2333,6 @@ TEST_F(FileReaderTest, TestHudiMORTwoNestedLevelArray) {
 
     Status status = file_reader->init(&ctx->format_scan_context);
 
-    // Illegal parquet files, will treat illegal column as null
     ASSERT_TRUE(status.ok()) << status.message();
 
     EXPECT_EQ(file_reader->row_group_size(), 1);
@@ -2302,8 +2346,8 @@ TEST_F(FileReaderTest, TestHudiMORTwoNestedLevelArray) {
 
     chunk->check_or_die();
 
-    EXPECT_EQ("['hello', NULL]", chunk->debug_row(0));
-    EXPECT_EQ("[NULL, NULL]", chunk->debug_row(1));
+    EXPECT_EQ("['hello', [[10,20,30],[40,50,60,70]]]", chunk->debug_row(0));
+    EXPECT_EQ("[NULL, [[30,40],[10,20,30]]]", chunk->debug_row(1));
     EXPECT_EQ("['hello', NULL]", chunk->debug_row(2));
 }
 
@@ -2840,7 +2884,7 @@ TEST_F(FileReaderTest, TestStructSubfieldDictFilter) {
             ASSERT_EQ("{c0:'55',c_struct:{c0:'55',c1:'46'}}", chunk->get_column_by_slot_id(3)->debug_item(0));
             const auto& c_struct_struct = chunk->get_column_by_slot_id(3);
             expect_string_data_column(get_struct_field_column(c_struct_struct, "c0"));
-            const auto& c_struct = get_struct_field_column(c_struct_struct, "c_struct");
+            ColumnPtr c_struct = get_struct_field_column(c_struct_struct, "c_struct");
             expect_string_data_column(get_struct_field_column(c_struct, "c0"));
             expect_string_data_column(get_struct_field_column(c_struct, "c1"));
         }
@@ -3671,17 +3715,37 @@ TEST_F(FileReaderTest, TestIsNullStatistics) {
     EXPECT_EQ(file_reader->row_group_size(), 0);
 }
 
+// c3 is list<map<struct<c3_1 int, c3_2 boolean>, list<struct<c3_3_1 date>>>>. A group map key no longer makes the
+// whole file unreadable: the schema resolves (key subtree, then value subtree) and the other columns read normally.
 TEST_F(FileReaderTest, TestMapKeyIsStruct) {
     const std::string filename = "./be/test/formats/parquet/test_data/map_key_is_struct.parquet";
 
     auto file_reader = _create_file_reader(filename);
     Utils::SlotDesc slot_descs[] = {
-            {"c0", TYPE_INT_DESC}, {"c1", TYPE_INT_DESC}, {"c2", TYPE_VARCHAR_DESC}, {"c3", TYPE_INT_ARRAY_DESC}, {""},
+            {"c1", TYPE_INT_DESC},
+            {""},
     };
     auto ctx = _create_file_random_read_context(filename, slot_descs);
-    Status status = file_reader->init(&ctx->format_scan_context);
-    ASSERT_FALSE(status.ok());
-    ASSERT_EQ("Map keys must be primitive type.", status.message());
+    ASSERT_OK(file_reader->init(&ctx->format_scan_context));
+
+    const auto& schema = file_reader->get_file_metadata()->schema();
+    const ParquetField* c3 = schema.get_stored_column_by_field_idx(schema.get_field_idx_by_column_name("c3"));
+    ASSERT_EQ(ColumnType::ARRAY, c3->type);
+    const ParquetField& map = c3->children[0];
+    ASSERT_EQ(ColumnType::MAP, map.type);
+    ASSERT_EQ(2, map.children.size());
+    ASSERT_EQ(ColumnType::STRUCT, map.children[0].type);
+    ASSERT_EQ(2, map.children[0].children.size());
+    // the value follows the whole key subtree
+    ASSERT_EQ("value", map.children[1].name);
+    ASSERT_EQ(ColumnType::ARRAY, map.children[1].type);
+
+    auto chunk = std::make_shared<Chunk>();
+    chunk->append_column(ColumnHelper::create_column(TYPE_INT_DESC, true), chunk->num_columns());
+    ASSERT_OK(file_reader->get_next(&chunk));
+    chunk->check_or_die();
+    ASSERT_EQ(1, chunk->num_rows());
+    EXPECT_EQ("[3]", chunk->debug_row(0));
 }
 
 TEST_F(FileReaderTest, TestInFilterStatitics) {
@@ -3856,6 +3920,144 @@ TEST_F(FileReaderTest, update_rf_and_filter_row_group) {
     chunk->reset();
     auto st = file_reader->get_next(&chunk);
     ASSERT_TRUE(st.is_end_of_file());
+}
+
+// ── Join runtime filter row-level pushdown (GroupReader stage 4.1) ──────────
+//
+// _filter_row_group_path_1 holds 2 row groups of 3 rows: col1 = 1..6, col2 = 11..66.
+// Every filter below spans [1,6], so row group statistics can never prune anything --
+// whatever rows disappear were dropped by the row-level probe, which is the point.
+
+// Probe column carries a conjunct entry, so it is classified active and the probe reads
+// it straight out of active_chunk.
+TEST_F(FileReaderTest, runtime_filter_pushdown_on_active_column) {
+    const SlotId slot_id = 0;
+    // Slot ids must match _create_int_chunk(), which keys columns positionally.
+    Utils::SlotDesc slot_descs[] = {{"col1", TYPE_INT_DESC, 0}, {"col2", TYPE_INT_DESC, 1}, {""}};
+    auto* ctx = _create_scan_context(slot_descs, _filter_row_group_path_1);
+
+    auto* rf = _pool.add(new Int32RF());
+    rf->get_membership_filter()->init(10);
+    rf->insert(1);
+    rf->insert(6);
+    ASSIGN_OR_ABORT(auto* rf_desc, gen_runtime_filter_desc(slot_id));
+    rf_desc->set_runtime_filter(rf);
+    _rf_probe_collector->add_descriptor(rf_desc);
+
+    TupleDescriptor* tuple_desc = Utils::create_tuple_descriptor(_runtime_state, &_pool, slot_descs);
+    ParquetUTBase::setup_conjuncts_manager(ctx->format_scan_context.conjunct_ctxs_by_slot[slot_id], _rf_probe_collector,
+                                           tuple_desc, _runtime_state, ctx);
+    _setup_rf_predicates(ctx, {{rf_desc, slot_id}});
+
+    auto file_reader = _create_file_reader(_filter_row_group_path_1);
+    ASSERT_OK(file_reader->init(&ctx->format_scan_context));
+    // min/max spans the whole file: neither row group is pruned by statistics.
+    ASSERT_EQ(file_reader->row_group_size(), 2);
+
+    // g_hdfs_stats is shared by every test in this file, so compare deltas.
+    const int64_t input_before = g_hdfs_stats.rf_cond_input_rows;
+    const int64_t output_before = g_hdfs_stats.rf_cond_output_rows;
+    ASSIGN_OR_ABORT(auto values, _read_all_int_col0(file_reader));
+    EXPECT_EQ(std::vector<int32_t>({1, 6}), values);
+    EXPECT_EQ(6, g_hdfs_stats.rf_cond_input_rows - input_before);
+    EXPECT_EQ(2, g_hdfs_stats.rf_cond_output_rows - output_before);
+}
+
+// Probe column has no conjunct, so classify_columns() leaves it lazy. The probe must
+// pull it on demand via materialize_slot(), and stage 5 must still emit correct values
+// for it through the _slot_cache triggered path.
+TEST_F(FileReaderTest, runtime_filter_pushdown_on_lazy_column) {
+    const SlotId probe_slot = 0; // col1: runtime filter target, no conjunct -> lazy
+    const SlotId other_slot = 1; // col2: carries the conjunct entry -> active
+    // Slot ids must match _create_int_chunk(), which keys columns positionally.
+    Utils::SlotDesc slot_descs[] = {{"col1", TYPE_INT_DESC, 0}, {"col2", TYPE_INT_DESC, 1}, {""}};
+    auto* ctx = _create_scan_context(slot_descs, _filter_row_group_path_1);
+
+    auto* rf = _pool.add(new Int32RF());
+    rf->get_membership_filter()->init(10);
+    rf->insert(1);
+    rf->insert(6);
+    ASSIGN_OR_ABORT(auto* rf_desc, gen_runtime_filter_desc(probe_slot));
+    rf_desc->set_runtime_filter(rf);
+    _rf_probe_collector->add_descriptor(rf_desc);
+
+    TupleDescriptor* tuple_desc = Utils::create_tuple_descriptor(_runtime_state, &_pool, slot_descs);
+    ParquetUTBase::setup_conjuncts_manager(ctx->format_scan_context.conjunct_ctxs_by_slot[other_slot],
+                                           _rf_probe_collector, tuple_desc, _runtime_state, ctx);
+    _setup_rf_predicates(ctx, {{rf_desc, probe_slot}});
+
+    auto file_reader = _create_file_reader(_filter_row_group_path_1);
+    ASSERT_OK(file_reader->init(&ctx->format_scan_context));
+    ASSERT_EQ(file_reader->row_group_size(), 2);
+
+    const int64_t lazy_reads_before = g_hdfs_stats.parquet_lazy_read_count;
+    ASSIGN_OR_ABORT(auto values, _read_all_int_col0(file_reader));
+    EXPECT_EQ(std::vector<int32_t>({1, 6}), values);
+    // Proves the probe really went through materialize_slot() rather than finding the
+    // column already in active_chunk -- without this the test would also pass if col1
+    // had been classified active.
+    EXPECT_GT(g_hdfs_stats.parquet_lazy_read_count, lazy_reads_before);
+}
+
+// Nothing has arrived: any_filter_ready() must short-circuit before any column is
+// materialized, and every row must still be emitted.
+TEST_F(FileReaderTest, runtime_filter_pushdown_filter_not_arrived) {
+    const SlotId slot_id = 0;
+    // Slot ids must match _create_int_chunk(), which keys columns positionally.
+    Utils::SlotDesc slot_descs[] = {{"col1", TYPE_INT_DESC, 0}, {"col2", TYPE_INT_DESC, 1}, {""}};
+    auto* ctx = _create_scan_context(slot_descs, _filter_row_group_path_1);
+
+    // Descriptor registered but set_runtime_filter() never called.
+    ASSIGN_OR_ABORT(auto* rf_desc, gen_runtime_filter_desc(slot_id));
+    _rf_probe_collector->add_descriptor(rf_desc);
+
+    TupleDescriptor* tuple_desc = Utils::create_tuple_descriptor(_runtime_state, &_pool, slot_descs);
+    ParquetUTBase::setup_conjuncts_manager(ctx->format_scan_context.conjunct_ctxs_by_slot[slot_id], _rf_probe_collector,
+                                           tuple_desc, _runtime_state, ctx);
+    _setup_rf_predicates(ctx, {{rf_desc, slot_id}});
+
+    auto file_reader = _create_file_reader(_filter_row_group_path_1);
+    ASSERT_OK(file_reader->init(&ctx->format_scan_context));
+
+    ASSIGN_OR_ABORT(auto values, _read_all_int_col0(file_reader));
+    EXPECT_EQ(std::vector<int32_t>({1, 2, 3, 4, 5, 6}), values);
+}
+
+// Two filters probing the same column. The probe chunk keys columns by id and rejects
+// duplicates, so the column must be collected once even though both predicates run.
+TEST_F(FileReaderTest, runtime_filter_pushdown_two_filters_same_column) {
+    const SlotId slot_id = 0;
+    // Slot ids must match _create_int_chunk(), which keys columns positionally.
+    Utils::SlotDesc slot_descs[] = {{"col1", TYPE_INT_DESC, 0}, {"col2", TYPE_INT_DESC, 1}, {""}};
+    auto* ctx = _create_scan_context(slot_descs, _filter_row_group_path_1);
+
+    auto* rf1 = _pool.add(new Int32RF());
+    rf1->get_membership_filter()->init(10);
+    rf1->insert(1);
+    rf1->insert(6);
+    ASSIGN_OR_ABORT(auto* rf_desc1, gen_runtime_filter_desc(slot_id, 1));
+    rf_desc1->set_runtime_filter(rf1);
+    _rf_probe_collector->add_descriptor(rf_desc1);
+
+    // Overlaps rf1 on 6 only, so the two together must keep exactly {6}.
+    auto* rf2 = _pool.add(new Int32RF());
+    rf2->get_membership_filter()->init(10);
+    rf2->insert(3);
+    rf2->insert(6);
+    ASSIGN_OR_ABORT(auto* rf_desc2, gen_runtime_filter_desc(slot_id, 2));
+    rf_desc2->set_runtime_filter(rf2);
+    _rf_probe_collector->add_descriptor(rf_desc2);
+
+    TupleDescriptor* tuple_desc = Utils::create_tuple_descriptor(_runtime_state, &_pool, slot_descs);
+    ParquetUTBase::setup_conjuncts_manager(ctx->format_scan_context.conjunct_ctxs_by_slot[slot_id], _rf_probe_collector,
+                                           tuple_desc, _runtime_state, ctx);
+    _setup_rf_predicates(ctx, {{rf_desc1, slot_id}, {rf_desc2, slot_id}});
+
+    auto file_reader = _create_file_reader(_filter_row_group_path_1);
+    ASSERT_OK(file_reader->init(&ctx->format_scan_context));
+
+    ASSIGN_OR_ABORT(auto values, _read_all_int_col0(file_reader));
+    EXPECT_EQ(std::vector<int32_t>({6}), values);
 }
 
 TEST_F(FileReaderTest, filter_page_index_with_rf_has_null) {
@@ -4578,6 +4780,37 @@ TEST_F(FileReaderTest, test_read_variant) {
     ASSERT_EQ(total_rows, 24) << "Should have read all 24 rows from the variant parquet file";
 }
 
+// Reads `path` from row `row` of a VariantColumn through VariantPathReader, as JSON ("<missing>" when absent).
+static std::string read_variant_path_json(const VariantColumn* column, size_t row, const std::string& path) {
+    auto parsed = VariantPathParser::parse(path);
+    if (!parsed.ok()) {
+        return "<bad path>";
+    }
+    VariantPathReader reader;
+    reader.prepare(column, &parsed.value());
+    auto read = reader.read_row(row);
+    if (read.state != VariantReadState::kValue) {
+        return "<missing>";
+    }
+    auto json = read.value.to_json();
+    return json.ok() ? json.value() : "<bad value>";
+}
+
+// The element VariantColumn of the ARRAY<VARIANT> typed path `path`, or nullptr.
+static const VariantColumn* variant_array_element_column(const VariantColumn* column, const std::string& path) {
+    const int idx = column->find_shredded_path(path);
+    if (idx < 0) {
+        return nullptr;
+    }
+    const Column* typed = ColumnHelper::get_data_column(column->typed_column_by_index(idx));
+    if (!typed->is_array()) {
+        return nullptr;
+    }
+    const Column* elements =
+            ColumnHelper::get_data_column(down_cast<const ArrayColumn*>(typed)->elements_column().get());
+    return elements->is_variant() ? down_cast<const VariantColumn*>(elements) : nullptr;
+}
+
 TEST_F(FileReaderTest, test_read_variant_shredding) {
     const std::string variant_file_path = "./be/test/formats/parquet/test_data/variant_shredding.parquet";
     auto file_reader = _create_file_reader(variant_file_path);
@@ -4611,6 +4844,35 @@ TEST_F(FileReaderTest, test_read_variant_shredding) {
     ASSERT_NE(-1, variant_col->find_shredded_path("numbers"));
     ASSERT_NE(-1, variant_col->find_shredded_path("groups"));
 
+    // "score" mixes INT32 typed values and string fallback values in this batch: the path keeps its INT type and
+    // the strings are carried in its fallback column.
+    const int score_idx = variant_col->find_shredded_path("score");
+    EXPECT_EQ(TYPE_INT, variant_col->shredded_types()[score_idx].type);
+    EXPECT_TRUE(variant_col->has_any_fallback_value(score_idx));
+    EXPECT_FALSE(variant_col->has_fallback_value(score_idx, 0));
+    EXPECT_TRUE(variant_col->has_fallback_value(score_idx, 1));
+    auto score_fallback = variant_col->fallback_value(score_idx, 1);
+    ASSERT_TRUE(score_fallback.ok()) << score_fallback.status().to_string();
+    EXPECT_EQ(R"("S81")", score_fallback->to_json().value());
+
+    // Shredded arrays are kept as ARRAY<VARIANT>, with the element children as typed paths of the element column.
+    const TypeDescriptor array_of_variant = TypeDescriptor::create_array_type(TypeDescriptor(TYPE_VARIANT));
+    for (const char* array_path : {"events", "numbers", "groups"}) {
+        EXPECT_EQ(array_of_variant, variant_col->shredded_types()[variant_col->find_shredded_path(array_path)])
+                << array_path;
+    }
+    const VariantColumn* event_elements = variant_array_element_column(variant_col, "events");
+    ASSERT_NE(nullptr, event_elements);
+    EXPECT_EQ(10, event_elements->size()); // 5 rows x 2 events
+    EXPECT_NE(-1, event_elements->find_shredded_path("type"));
+    EXPECT_NE(-1, event_elements->find_shredded_path("count"));
+    EXPECT_EQ("2", read_variant_path_json(variant_col, 0, "$.events[1].count"));
+    EXPECT_EQ(R"("click")", read_variant_path_json(variant_col, 0, "$.events[1].type"));
+    EXPECT_EQ(R"("detail_view_0")", read_variant_path_json(variant_col, 0, "$.events[0].detail"));
+    EXPECT_EQ("41", read_variant_path_json(variant_col, 1, "$.groups[1].scores[0]"));
+    EXPECT_EQ(R"("note_1_1")", read_variant_path_json(variant_col, 1, "$.groups[1].note"));
+    EXPECT_EQ("4", read_variant_path_json(variant_col, 1, "$.numbers[2]"));
+
     VariantRowValue row0;
     ASSERT_NE(variant_col->get_row_value(0, &row0), nullptr);
     auto row0_json = row0.to_json();
@@ -4633,6 +4895,52 @@ TEST_F(FileReaderTest, test_read_variant_shredding) {
     ASSERT_TRUE(row1_json.value().find("\"score\":\"S81\"") != std::string::npos);
     ASSERT_TRUE(row1_json.value().find("\"rank\":\"L2\"") != std::string::npos);
     ASSERT_TRUE(row1_json.value().find("\"numbers\":[2,3,4]") != std::string::npos);
+}
+
+// A shredded array requested through an access path keeps its shredded element fields: the element children have
+// element-relative paths and must be read even though they do not match the row-level requested path.
+TEST_F(FileReaderTest, test_read_variant_shredding_with_array_access_path) {
+    const std::string variant_file_path = "./be/test/formats/parquet/test_data/variant_shredding.parquet";
+    auto file_reader = _create_file_reader(variant_file_path);
+
+    TypeDescriptor variant_type = TypeDescriptor::from_logical_type(LogicalType::TYPE_VARIANT);
+    Utils::SlotDesc slot_descs[] = {{"data", variant_type}, {""}};
+    auto ctx = _create_scan_context(slot_descs, variant_file_path);
+
+    std::vector<ColumnAccessPathPtr> column_access_paths;
+    auto root_or = ColumnAccessPath::create(TAccessPathType::ROOT, "data", 0);
+    ASSERT_TRUE(root_or.ok()) << root_or.status().to_string();
+    auto root = std::move(root_or).value();
+    for (const char* field : {"events", "groups"}) {
+        auto field_or = ColumnAccessPath::create(TAccessPathType::FIELD, field, 0, root->absolute_path());
+        ASSERT_TRUE(field_or.ok()) << field_or.status().to_string();
+        root->children().emplace_back(std::move(field_or).value());
+    }
+    column_access_paths.emplace_back(std::move(root));
+    ctx->format_scan_context.column_access_paths = std::move(column_access_paths);
+
+    Status status = file_reader->init(&ctx->format_scan_context);
+    ASSERT_TRUE(status.ok()) << status.message();
+    auto chunk = std::make_shared<Chunk>();
+    chunk->append_column(ColumnHelper::create_column(variant_type, true), chunk->num_columns());
+    status = file_reader->get_next(&chunk);
+    ASSERT_TRUE(status.ok()) << status.message();
+    ASSERT_EQ(5, chunk->num_rows());
+
+    const auto* nullable = down_cast<const NullableColumn*>(chunk->get_column_by_index(0).get());
+    const auto* variant_col = down_cast<const VariantColumn*>(nullable->data_column().get());
+    for (size_t row = 0; row < 5; ++row) {
+        EXPECT_EQ(std::to_string(row + 1), read_variant_path_json(variant_col, row, "$.events[0].count"));
+        EXPECT_EQ(std::to_string((row + 1) * 2), read_variant_path_json(variant_col, row, "$.events[1].count"));
+        EXPECT_EQ(R"("view")", read_variant_path_json(variant_col, row, "$.events[0].type"));
+        EXPECT_EQ(std::to_string(40 + row), read_variant_path_json(variant_col, row, "$.groups[1].scores[0]"));
+    }
+    VariantRowValue row0;
+    ASSERT_NE(nullptr, variant_col->get_row_value(0, &row0));
+    auto row0_json = row0.to_json();
+    ASSERT_TRUE(row0_json.ok());
+    EXPECT_NE(std::string::npos, row0_json.value().find(R"("count":1)")) << row0_json.value();
+    EXPECT_NE(std::string::npos, row0_json.value().find(R"("scores":[40,50,60])")) << row0_json.value();
 }
 
 TEST_F(FileReaderTest, test_read_variant_shredding_with_access_paths) {
@@ -4886,6 +5194,138 @@ TEST_F(FileReaderTest, test_read_variant_shredding_with_whole_column_access_path
     ASSERT_NE(-1, variant_col->find_shredded_path("age"));
     ASSERT_NE(-1, variant_col->find_shredded_path("profile.salary"));
     ASSERT_NE(-1, variant_col->find_shredded_path("events"));
+}
+
+// variant_shredding_nested_residual.parquet (see gen_variant_shredding_nested_residual.py) shreds
+// `commit.collection` and keeps the other fields of `commit` in the residual `typed_value.commit.value`.
+static const char* kNestedResidualVariantFile =
+        "./be/test/formats/parquet/test_data/variant_shredding_nested_residual.parquet";
+
+static std::string variant_row_json(const VariantColumn* variant_col, size_t row) {
+    VariantRowValue value;
+    EXPECT_NE(variant_col->get_row_value(row, &value), nullptr);
+    auto json = value.to_json();
+    EXPECT_TRUE(json.ok()) << json.status().to_string();
+    return json.ok() ? json.value() : std::string();
+}
+
+TEST_F(FileReaderTest, test_read_variant_shredding_nested_residual) {
+    auto file_reader = _create_file_reader(kNestedResidualVariantFile);
+
+    TypeDescriptor variant_type = TypeDescriptor::from_logical_type(LogicalType::TYPE_VARIANT);
+    Utils::SlotDesc slot_descs[] = {{"data", variant_type}, {""}};
+    auto ctx = _create_scan_context(slot_descs, kNestedResidualVariantFile);
+    ASSERT_OK(file_reader->init(&ctx->format_scan_context));
+
+    auto chunk = std::make_shared<Chunk>();
+    chunk->append_column(ColumnHelper::create_column(variant_type, true), chunk->num_columns());
+    ASSERT_OK(file_reader->get_next(&chunk));
+    ASSERT_EQ(5, chunk->num_rows());
+
+    const auto* nullable = down_cast<const NullableColumn*>(chunk->get_column_by_index(0).get());
+    const auto* variant_col = down_cast<const VariantColumn*>(nullable->data_column().get());
+    // The residual of `commit` is the fallback of path `commit` (its typed column stays null), and the shredded
+    // child `commit.collection` keeps its own typed path; rows are rebuilt from the residual plus the children.
+    const int commit_idx = variant_col->find_shredded_path("commit");
+    ASSERT_NE(-1, commit_idx);
+    EXPECT_EQ(TYPE_VARIANT, variant_col->shredded_types()[commit_idx].type);
+    EXPECT_TRUE(variant_col->has_any_fallback_value(commit_idx));
+    ASSERT_NE(-1, variant_col->find_shredded_path("commit.collection"));
+    // A residual field is read from the residual, a shredded child from its typed column, and the object itself
+    // merges both.
+    EXPECT_EQ(R"({"text":"hello"})", read_variant_path_json(variant_col, 0, "$.commit.record"));
+    EXPECT_EQ(R"("post")", read_variant_path_json(variant_col, 0, "$.commit.collection"));
+    EXPECT_EQ(R"({"collection":"post","record":{"text":"hello"}})", read_variant_path_json(variant_col, 0, "$.commit"));
+    EXPECT_EQ("<missing>", read_variant_path_json(variant_col, 1, "$.commit.record"));
+
+    ASSERT_EQ(R"({"commit":{"collection":"post","record":{"text":"hello"}},"kind":"commit"})",
+              variant_row_json(variant_col, 0));
+    ASSERT_EQ(R"({"commit":{"collection":"like"},"kind":"commit"})", variant_row_json(variant_col, 1));
+    // `note` lives only in its own fallback `value` column.
+    ASSERT_EQ(R"({"extra":1,"kind":"identity","note":"n1"})", variant_row_json(variant_col, 2));
+    ASSERT_TRUE(nullable->is_null(3));
+    // A row whose only payload is the residual of `commit` is not null.
+    ASSERT_FALSE(nullable->is_null(4));
+    ASSERT_EQ(R"({"commit":{"rev":"r1"}})", variant_row_json(variant_col, 4));
+}
+
+TEST_F(FileReaderTest, test_read_variant_shredding_nested_residual_with_access_path) {
+    auto file_reader = _create_file_reader(kNestedResidualVariantFile);
+
+    TypeDescriptor variant_type = TypeDescriptor::from_logical_type(LogicalType::TYPE_VARIANT);
+    Utils::SlotDesc slot_descs[] = {{"data", variant_type}, {""}};
+    auto ctx = _create_scan_context(slot_descs, kNestedResidualVariantFile);
+
+    // data.commit.record is not shredded: it lives in the residual of the shredded `commit`.
+    ASSIGN_OR_ABORT(auto root, ColumnAccessPath::create(TAccessPathType::ROOT, "data", 0));
+    ASSIGN_OR_ABORT(auto commit, ColumnAccessPath::create(TAccessPathType::FIELD, "commit", 0, root->absolute_path()));
+    ASSIGN_OR_ABORT(auto record,
+                    ColumnAccessPath::create(TAccessPathType::FIELD, "record", 0, commit->absolute_path()));
+    commit->children().emplace_back(std::move(record));
+    root->children().emplace_back(std::move(commit));
+    std::vector<ColumnAccessPathPtr> column_access_paths;
+    column_access_paths.emplace_back(std::move(root));
+    ctx->format_scan_context.column_access_paths = std::move(column_access_paths);
+    ASSERT_OK(file_reader->init(&ctx->format_scan_context));
+
+    auto chunk = std::make_shared<Chunk>();
+    chunk->append_column(ColumnHelper::create_column(variant_type, true), chunk->num_columns());
+    ASSERT_OK(file_reader->get_next(&chunk));
+    ASSERT_EQ(5, chunk->num_rows());
+
+    const auto* nullable = down_cast<const NullableColumn*>(chunk->get_column_by_index(0).get());
+    const auto* variant_col = down_cast<const VariantColumn*>(nullable->data_column().get());
+    int record_idx = variant_col->find_shredded_path("commit.record");
+    ASSERT_NE(-1, record_idx);
+    const Column* record_col = variant_col->typed_column_by_index(record_idx);
+    ASSERT_FALSE(record_col->is_null(0));
+    const auto* record_variant =
+            down_cast<const VariantColumn*>(down_cast<const NullableColumn*>(record_col)->data_column().get());
+    ASSERT_EQ(R"({"text":"hello"})", variant_row_json(record_variant, 0));
+    ASSERT_TRUE(record_col->is_null(1));
+    ASSERT_TRUE(record_col->is_null(2));
+    ASSERT_TRUE(nullable->is_null(3));
+}
+
+TEST_F(FileReaderTest, test_read_variant_shredding_full_column_ignores_extended_access_path) {
+    auto file_reader = _create_file_reader(kNestedResidualVariantFile);
+
+    TypeDescriptor variant_type = TypeDescriptor::from_logical_type(LogicalType::TYPE_VARIANT);
+    Utils::SlotDesc slot_descs[] = {{"data", variant_type}, {""}};
+    auto ctx = _create_scan_context(slot_descs, kNestedResidualVariantFile);
+
+    // The extended access path the FE emits for a virtual column of get_variant_string(data, '$.commit.collection')
+    // describes that virtual column, not `data`: the full `data` column must not be narrowed to it.
+    TColumnAccessPath tleaf;
+    tleaf.__set_type(TAccessPathType::FIELD);
+    tleaf.__set_type_desc(TypeDescriptor::create_varchar_type(1048576).to_thrift());
+    TColumnAccessPath tcommit;
+    tcommit.__set_type(TAccessPathType::FIELD);
+    tcommit.__set_children({tleaf});
+    TColumnAccessPath troot;
+    troot.__set_type(TAccessPathType::ROOT);
+    troot.__set_extended(true);
+    troot.__set_children({tcommit});
+    std::vector<std::string> resolved = {"data", "commit", "collection"};
+    size_t resolve_index = 0;
+    auto resolver = [&](const TColumnAccessPath&) -> StatusOr<std::string> { return resolved[resolve_index++]; };
+    ASSIGN_OR_ABORT(auto root, ColumnAccessPath::create(troot, resolver));
+    std::vector<ColumnAccessPathPtr> column_access_paths;
+    column_access_paths.emplace_back(std::move(root));
+    ctx->format_scan_context.column_access_paths = std::move(column_access_paths);
+    ASSERT_OK(file_reader->init(&ctx->format_scan_context));
+
+    auto chunk = std::make_shared<Chunk>();
+    chunk->append_column(ColumnHelper::create_column(variant_type, true), chunk->num_columns());
+    ASSERT_OK(file_reader->get_next(&chunk));
+    ASSERT_EQ(5, chunk->num_rows());
+
+    const auto* nullable = down_cast<const NullableColumn*>(chunk->get_column_by_index(0).get());
+    const auto* variant_col = down_cast<const VariantColumn*>(nullable->data_column().get());
+    ASSERT_EQ(R"({"commit":{"collection":"post","record":{"text":"hello"}},"kind":"commit"})",
+              variant_row_json(variant_col, 0));
+    // `note` lives only in its own fallback `value` column.
+    ASSERT_EQ(R"({"extra":1,"kind":"identity","note":"n1"})", variant_row_json(variant_col, 2));
 }
 
 } // namespace starrocks::parquet

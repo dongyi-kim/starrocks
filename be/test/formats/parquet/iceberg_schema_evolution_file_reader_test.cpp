@@ -21,7 +21,7 @@
 #include "column/fixed_length_column.h"
 #include "common/config_exec_fwd.h"
 #include "common/logging.h"
-#include "exec/hdfs_scanner/hdfs_scanner.h"
+#include "connector/hive/scanner/hdfs_scanner.h"
 #include "exprs/expr_executor.h"
 #include "exprs/expr_factory.h"
 #include "formats/parquet/column_chunk_reader.h"
@@ -119,7 +119,6 @@ protected:
         ctx->format_scan_context.scan_range_length = scan_range->length;
     }
 
-    std::shared_ptr<RowDescriptor> _row_desc = nullptr;
     RuntimeState* _runtime_state = nullptr;
     ObjectPool _pool;
 

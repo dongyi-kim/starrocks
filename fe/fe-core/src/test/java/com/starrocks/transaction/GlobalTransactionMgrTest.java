@@ -57,6 +57,7 @@ import com.starrocks.common.StarRocksException;
 import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.common.util.UUIDUtil;
 import com.starrocks.common.util.concurrent.lock.LockTimeoutException;
+import com.starrocks.ha.FrontendNodeType;
 import com.starrocks.load.loadv2.ManualLoadTxnCommitAttachment;
 import com.starrocks.load.routineload.KafkaProgress;
 import com.starrocks.load.routineload.KafkaRoutineLoadJob;
@@ -90,6 +91,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
 import java.io.DataInputStream;
@@ -136,6 +138,7 @@ public class GlobalTransactionMgrTest {
         fakeGlobalStateMgr = new FakeGlobalStateMgr();
         fakeTransactionIDGenerator = new FakeTransactionIDGenerator();
         masterGlobalStateMgr = GlobalStateMgrTestUtil.createTestState();
+        masterGlobalStateMgr.setFrontendNodeType(FrontendNodeType.LEADER);
         slaveGlobalStateMgr = GlobalStateMgrTestUtil.createTestState();
         masterTransMgr = masterGlobalStateMgr.getGlobalTransactionMgr();
         slaveTransMgr = slaveGlobalStateMgr.getGlobalTransactionMgr();
@@ -1127,6 +1130,70 @@ public class GlobalTransactionMgrTest {
     }
 
     @Test
+    public void testRetryCommitPreparedOnRateLimitExceeded() throws StarRocksException {
+        Database db = new Database(10, "db0");
+        GlobalTransactionMgr globalTransactionMgr = spy(new GlobalTransactionMgr(GlobalStateMgr.getCurrentState()));
+        DatabaseTransactionMgr dbTransactionMgr = spy(new DatabaseTransactionMgr(10L, GlobalStateMgr.getCurrentState()));
+        TransactionState transactionState = new TransactionState();
+        VisibleStateWaiter waiter = new VisibleStateWaiter(new TransactionState());
+
+        doReturn(transactionState).when(globalTransactionMgr).getTransactionState(db.getId(), 1001L);
+        doReturn(dbTransactionMgr).when(globalTransactionMgr).getDatabaseTransactionMgr(db.getId());
+        doThrow(new CommitRateExceededException(1001, System.currentTimeMillis()))
+                .doReturn(waiter)
+                .when(dbTransactionMgr)
+                .commitPreparedTransaction(1001L);
+
+        Assertions.assertSame(waiter,
+                globalTransactionMgr.retryCommitPreparedOnRateLimitExceeded(db, 1001L, 1000L));
+
+        Mockito.verify(dbTransactionMgr, Mockito.times(2)).commitPreparedTransaction(1001L);
+    }
+
+    @Test
+    public void testRetryCommitPreparedUsesRemainingLockTimeout() throws StarRocksException {
+        Database db = new Database(10, "db0");
+        GlobalTransactionMgr globalTransactionMgr = spy(new GlobalTransactionMgr(GlobalStateMgr.getCurrentState()));
+        VisibleStateWaiter waiter = new VisibleStateWaiter(new TransactionState());
+        long timeoutMs = 1000L;
+
+        doThrow(new CommitRateExceededException(1001L, System.currentTimeMillis() + 50L))
+                .doReturn(waiter)
+                .when(globalTransactionMgr)
+                .commitPreparedTransactionUnderIntensiveDbLock(
+                        Mockito.eq(db), Mockito.eq(1001L), Mockito.anyLong());
+
+        Assertions.assertSame(waiter,
+                globalTransactionMgr.retryCommitPreparedOnRateLimitExceeded(db, 1001L, timeoutMs));
+
+        ArgumentCaptor<Long> lockTimeoutCaptor = ArgumentCaptor.forClass(Long.class);
+        Mockito.verify(globalTransactionMgr, Mockito.times(2))
+                .commitPreparedTransactionUnderIntensiveDbLock(
+                        Mockito.eq(db), Mockito.eq(1001L), lockTimeoutCaptor.capture());
+        List<Long> lockTimeouts = lockTimeoutCaptor.getAllValues();
+        Assertions.assertEquals(timeoutMs, lockTimeouts.get(0));
+        Assertions.assertTrue(lockTimeouts.get(1) > 0L);
+        Assertions.assertTrue(lockTimeouts.get(1) < timeoutMs);
+    }
+
+    @Test
+    public void testRetryCommitPreparedOnRateLimitExceededTimeout() throws StarRocksException {
+        Database db = new Database(10, "db0");
+        GlobalTransactionMgr globalTransactionMgr = spy(new GlobalTransactionMgr(GlobalStateMgr.getCurrentState()));
+        DatabaseTransactionMgr dbTransactionMgr = spy(new DatabaseTransactionMgr(10L, GlobalStateMgr.getCurrentState()));
+        TransactionState transactionState = new TransactionState();
+
+        doReturn(transactionState).when(globalTransactionMgr).getTransactionState(db.getId(), 1001L);
+        doReturn(dbTransactionMgr).when(globalTransactionMgr).getDatabaseTransactionMgr(db.getId());
+        doThrow(new CommitRateExceededException(1001, System.currentTimeMillis() + 60_000L))
+                .when(dbTransactionMgr)
+                .commitPreparedTransaction(1001L);
+
+        Assertions.assertThrows(CommitRateExceededException.class,
+                () -> globalTransactionMgr.retryCommitPreparedOnRateLimitExceeded(db, 1001L, 10L));
+    }
+
+    @Test
     public void testPublishVersionTimeout()
             throws StarRocksException, LockTimeoutException {
         Database db = new Database(10, "db0");
@@ -1144,6 +1211,31 @@ public class GlobalTransactionMgrTest {
     }
 
     @Test
+    public void testPublishWaitStopsAfterCommitWhenLeaderDemotes()
+            throws Exception {
+        Database db = new Database(10, "db0");
+        GlobalStateMgr globalStateMgr = spy(GlobalStateMgrTestUtil.createTestState());
+        GlobalTransactionMgr globalTransactionMgr = spy(new GlobalTransactionMgr(globalStateMgr));
+        DatabaseTransactionMgr dbTransactionMgr = spy(new DatabaseTransactionMgr(10L, globalStateMgr));
+        TransactionState transactionState = spy(new TransactionState());
+
+        doReturn(true).when(globalStateMgr).isLeader();
+        doReturn(false).when(globalStateMgr).isLeaderWorkAdmissionOpen();
+        doReturn(false).when(globalStateMgr).isLeaderDemoting();
+        doReturn(dbTransactionMgr).when(globalTransactionMgr).getDatabaseTransactionMgr(db.getId());
+        doReturn(transactionState).when(globalTransactionMgr).getTransactionState(db.getId(), 1001);
+        doReturn(new VisibleStateWaiter(new TransactionState()))
+                .when(dbTransactionMgr)
+                .commitTransaction(1001L, Collections.emptyList(), Collections.emptyList(), null);
+
+        long startMs = System.currentTimeMillis();
+        Assertions.assertFalse(globalTransactionMgr.commitAndPublishTransaction(db, 1001,
+                Collections.emptyList(), Collections.emptyList(), 1500, null));
+        long elapsedMs = System.currentTimeMillis() - startMs;
+        Assertions.assertTrue(elapsedMs < 1000, "publish wait should stop quickly after leader demotion");
+    }
+
+    @Test
     public void testRetryCommitOnRateLimitExceededThrowUnexpectedException()
             throws StarRocksException {
         Database db = new Database(10, "db0");
@@ -1156,6 +1248,20 @@ public class GlobalTransactionMgrTest {
                 .commitTransaction(1001L, Collections.emptyList(), Collections.emptyList(), null);
         Assertions.assertThrows(StarRocksException.class, () -> globalTransactionMgr.commitAndPublishTransaction(db, 1001,
                 Collections.emptyList(), Collections.emptyList(), 10, null));
+    }
+
+    @Test
+    public void testRetryCommitMissingTransactionDoesNotThrowNpe()
+            throws StarRocksException {
+        Database db = new Database(10, "db0");
+        GlobalTransactionMgr globalTransactionMgr = spy(new GlobalTransactionMgr(GlobalStateMgr.getCurrentState()));
+
+        doReturn(null).when(globalTransactionMgr).getTransactionState(db.getId(), 1001);
+        StarRocksException exception = Assertions.assertThrows(StarRocksException.class,
+                () -> globalTransactionMgr.commitAndPublishTransaction(db, 1001,
+                        Collections.emptyList(), Collections.emptyList(), 10, null));
+        Assertions.assertTrue(exception.getMessage().contains("transaction not found: 1001"));
+        Assertions.assertFalse(exception.getMessage().contains("Cannot invoke"));
     }
 
     @Test

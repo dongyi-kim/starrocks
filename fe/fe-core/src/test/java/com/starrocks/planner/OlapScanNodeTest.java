@@ -66,6 +66,7 @@ public class OlapScanNodeTest {
         opts.setDistanceSlotId(1);
         opts.setQueryVector(Arrays.asList("1.0", "2.0", "3.0"));
         opts.setResultOrder(true);
+        opts.setPredicateRange(-1.5);
         scanNode.setVectorSearchOptions(opts);
 
         TPlanNode msg = new TPlanNode();
@@ -79,6 +80,8 @@ public class OlapScanNodeTest {
                 msg.lake_scan_node.getVector_search_options().getVector_distance_column_name());
         Assertions.assertEquals(Arrays.asList("1.0", "2.0", "3.0"),
                 msg.lake_scan_node.getVector_search_options().getQuery_vector());
+        Assertions.assertTrue(msg.lake_scan_node.getVector_search_options().isHas_vector_range());
+        Assertions.assertEquals(-1.5, msg.lake_scan_node.getVector_search_options().getVector_range());
     }
 
     @Test
@@ -122,5 +125,34 @@ public class OlapScanNodeTest {
         ConnectContext ctx = new ConnectContext();
         ctx.setScanVersionOverride(override);
         assertEquals(Long.valueOf(7L), ctx.getScanVersionOverride().get(PHYSICAL_PARTITION_ID));
+    }
+
+    // When the per-scan decision turns the prepared-physical-split scan on, toThrift must
+    // propagate it as an explicitly-set optional field on the lake_scan_node so the BE
+    // LakeDataSourceProvider::init can read it.
+    @Test
+    public void testPreparedPhysicalSplitScanToThrift() {
+        OlapScanNode scanNode = createOlapScanNode(Table.TableType.CLOUD_NATIVE);
+        scanNode.setUsePreparedPhysicalSplitScan(true);
+
+        TPlanNode msg = new TPlanNode();
+        scanNode.toThrift(msg);
+
+        Assertions.assertNotNull(msg.lake_scan_node);
+        Assertions.assertTrue(msg.lake_scan_node.isSetUse_prepared_physical_split_scan());
+        Assertions.assertTrue(msg.lake_scan_node.isUse_prepared_physical_split_scan());
+    }
+
+    // The optional flag must stay unset by default so an unchanged BE treats the isset
+    // guard as "feature off" rather than reading a defaulted false.
+    @Test
+    public void testPreparedPhysicalSplitScanToThriftDefaultUnset() {
+        OlapScanNode scanNode = createOlapScanNode(Table.TableType.CLOUD_NATIVE);
+
+        TPlanNode msg = new TPlanNode();
+        scanNode.toThrift(msg);
+
+        Assertions.assertNotNull(msg.lake_scan_node);
+        Assertions.assertFalse(msg.lake_scan_node.isSetUse_prepared_physical_split_scan());
     }
 }

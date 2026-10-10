@@ -16,18 +16,22 @@
 
 #include <butil/file_util.h>
 #include <butil/files/file_path.h>
+#include <curl/curl.h>
 
 #include <algorithm>
 #include <memory>
+#include <thread>
 
 #include "agent/agent_server.h"
 #include "base/path/file_util.h"
 #include "base/time/timezone_utils.h"
+#include "base/utility/defer_op.h"
 #include "cache/datacache.h"
 #include "common/config_cache_fwd.h"
 #include "common/config_exec_env_fwd.h"
 #include "common/config_lake_fwd.h"
 #include "common/config_path_fwd.h"
+#include "common/config_runtime_fwd.h"
 #include "common/config_storage_fwd.h"
 #include "common/glog_init.h"
 #include "common/metrics/process_metrics_registry.h"
@@ -41,6 +45,7 @@
 #include "exec/pipeline/driver_executor_factory.h"
 #include "exec/pipeline/driver_queue_factory.h"
 #include "exec/pipeline/query_context.h"
+#include "exec/schema_scanner_factory.h"
 #include "exec_primitive/pipeline/primitives/pipeline_metrics.h"
 #include "gtest/gtest.h"
 #include "module/connector_bootstrap.h"
@@ -64,7 +69,7 @@ namespace starrocks {
 
 extern void shutdown_tracer();
 
-int init_test_env(int argc, char** argv) {
+int init_test_env(int argc, char** argv, std::unique_ptr<SchemaScannerFactory> schema_scanner_factory = nullptr) {
     ::testing::InitGoogleTest(&argc, argv);
     if (getenv("STARROCKS_HOME") == nullptr) {
         fprintf(stderr, "you need set STARROCKS_HOME environment variable.\n");
@@ -75,6 +80,12 @@ int init_test_env(int argc, char** argv) {
         fprintf(stderr, "error read config file. \n");
         return -1;
     }
+    const CURLcode curl_status = curl_global_init(CURL_GLOBAL_ALL);
+    if (curl_status != CURLE_OK) {
+        fprintf(stderr, "failed to initialize libcurl, curl_status=%d\n", static_cast<int>(curl_status));
+        return -1;
+    }
+    DeferOp curl_cleanup([] { curl_global_cleanup(); });
     auto fs_registry_status = fs::install_builtin_file_system_providers();
     CHECK(fs_registry_status.ok()) << fs_registry_status;
     butil::FilePath curr_dir(std::filesystem::current_path());
@@ -87,6 +98,12 @@ int init_test_env(int argc, char** argv) {
     config::l0_snapshot_size = 1048576;
     config::storage_flood_stage_left_capacity_bytes = 10485600;
     config::spill_local_storage_dir = spill_path.value();
+    // Dozens of thread pools size themselves from CpuInfo::num_cores() (global_thread_pools.cpp
+    // alone has ~10 such sites), so on a big host a unit-test process builds pools sized for the whole
+    // machine and then tears them down again -- pure overhead for tests that run almost no concurrent
+    // work. CpuInfo::init() below honours config::num_cores when it is > 0, so cap it here. Never raise
+    // it above what the host actually has.
+    config::num_cores = std::min<int32_t>(8, std::max(1U, std::thread::hardware_concurrency()));
 
     FLAGS_alsologtostderr = true;
     init_glog(argv[0], true);
@@ -182,7 +199,7 @@ int init_test_env(int argc, char** argv) {
     exec_env->set_compute_env(compute_env.get());
     st = runtime_env->init_lake_thread_pools(process_metrics);
     CHECK(st.ok()) << st;
-    st = exec_env->init(process_metrics_registry, runtime_env);
+    st = exec_env->init(process_metrics_registry, runtime_env, std::move(schema_scanner_factory));
     CHECK(st.ok()) << st;
 
     StorageEnvOptions storage_env_options;
@@ -210,11 +227,13 @@ int init_test_env(int argc, char** argv) {
     data_workflows_env_options.metrics = process_metrics_registry->root_registry();
     data_workflows_env_options.table_metrics_mgr = process_metrics_registry->table_metrics_mgr();
     data_workflows_env_options.load_mem_tracker = runtime_env->load_mem_tracker();
+    data_workflows_env_options.load_stream_mgr = exec_env->load_stream_mgr();
     st = data_workflows_env->init(data_workflows_env_options);
     CHECK(st.ok()) << st;
 
     auto orchestration_env = std::make_unique<orchestration::OrchestrationEnv>();
-    st = orchestration_env->init(exec_env, process_metrics_registry->root_registry());
+    st = orchestration_env->init(exec_env, process_metrics_registry->root_registry(),
+                                 data_workflows_env->stream_load_executor());
     CHECK(st.ok()) << st;
 
     auto agent_server = std::make_unique<AgentServer>(exec_env, false);
@@ -248,6 +267,8 @@ int init_test_env(int argc, char** argv) {
 #endif
     orchestration_env->destroy();
     orchestration_env.reset();
+    // Query contexts and orchestration callbacks must release their non-owning
+    // BatchWriteMgr references before DataWorkflows is destroyed.
     data_workflows_env->destroy();
     data_workflows_env.reset();
     delete engine;
