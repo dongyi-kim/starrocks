@@ -25,6 +25,7 @@ import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptimizerContext;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.operator.AggType;
+import com.starrocks.sql.optimizer.operator.OpRuleBit;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.logical.LogicalAggregationOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalDeltaOperator;
@@ -62,7 +63,7 @@ import java.util.stream.Collectors;
  * <p>The output plan structure:
  * <pre>
  *   Project(state_union(intermediate, mv_state), original_projection...)
- *     └── LeftOuterJoin(encode_row_id(group_keys) = mv.__ROW_ID__)
+ *     └── LeftOuterJoin(encode(group_keys) = mv.__ROW_ID__)
  *           ├── Aggregate(intermediate _combine)
  *           │     └── Delta(...)       ← preserved for subsequent iterations
  *           │           └── child...
@@ -116,6 +117,9 @@ public class IvmDeltaAggregateRule extends TransformationRule {
         // Step 2: Create MV scan
         LogicalOlapScanOperator mvScan = MvRewritePreprocessor.createScanMvOperator(
                 mv, columnRefFactory, PCellSortedSet.of(), true);
+        // The refresh reads back the state it maintains, hidden columns included: a transparent rewrite of the MV
+        // (transparent_mv_rewrite_mode) would replace it with the defined query, which outputs none of them.
+        mvScan.setOpRuleBit(OpRuleBit.OP_MV_TRANSPARENT_REWRITE);
         ColumnRefOperator mvRowIdRef = mvScan.getColumnMetaToColRefMap().get(rowIdColumn);
         Map<Column, ColumnRefOperator> mvColMetaToRefMap = mvScan.getColumnMetaToColRefMap();
 

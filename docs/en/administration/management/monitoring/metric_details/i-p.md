@@ -15,7 +15,7 @@ Metrics for materialized views and shared-data clusters are detailed in the corr
 - [Metrics for asynchronous materialized view metrics](../metrics-materialized_view.md)
 - [Metrics for Shared-data Dashboard metrics, and Starlet Dashboard metrics](../metrics-shared-data.md)
 
-For more information on how to build a monitoring service for your StarRocks cluster, see [Monitor and Alert](../Monitor_and_Alert.md).
+For more information on how to build a monitoring service for your StarRocks cluster, see [Monitor and Alert](../monitoring.md).
 
 :::
 
@@ -55,37 +55,6 @@ For more information on how to build a monitoring service for your StarRocks clu
 - Type: Cumulative
 - Labels: `compaction_type` (`manual` or `auto`)
 - Description: Total number of Iceberg compaction (`rewrite_data_files`) tasks.
-
-## `iceberg_delete_bytes`
-
-- Unit: Bytes
-- Type: Cumulative
-- Labels: `delete_type` (`position` or `metadata`)
-- Description: Total deleted bytes from Iceberg `DELETE` tasks. For `metadata` delete, this represents the size of deleted data files. For `position` delete, this represents the size of position delete files created.
-
-## `iceberg_delete_duration_ms_total`
-
-- Unit: Millisecond
-- Type: Cumulative
-- Labels: `delete_type` (`position` or `metadata`)
-- Description: Total execution time of Iceberg `DELETE` tasks in milliseconds. The duration of each task is added after it ends. `delete_type` distinguishes between two delete methods.
-
-## `iceberg_delete_rows`
-
-- Unit: Rows
-- Type: Cumulative
-- Labels: `delete_type` (`position` or `metadata`)
-- Description: Total deleted rows from Iceberg `DELETE` tasks. For `metadata` delete, this represents the number of rows in deleted data files. For `position` delete, this represents the number of position deletes created.
-
-## `iceberg_delete_total`
-
-- Unit: Count
-- Type: Cumulative
-- Labels:
-  - `status` (`success` or `failed`)
-  - `reason` (`none`, `timeout`, `oom`, `access_denied`, `unknown`)
-  - `delete_type` (`position` or `metadata`)
-- Description: Total number of `DELETE` tasks that target Iceberg tables. The metric is incremented by 1 after each task ends, regardless of success or failure. `delete_type` distinguishes between two delete methods: `position` (generates position delete files) and `metadata` (metadata-level delete).
 
 ## `iceberg_merge_bytes`
 
@@ -245,6 +214,11 @@ For more information on how to build a monitoring service for your StarRocks clu
 - Unit: Bytes
 - Description: Total number of bytes allocated by the application.
 
+## `jemalloc_dirty_bytes`
+
+- Unit: Bytes
+- Description: Total number of bytes in unused dirty pages, which have not yet been `madvise`d back to the operating system and can be reused for new allocations without a page fault.
+
 ## `jemalloc_mapped_bytes`
 
 - Unit: Bytes
@@ -260,6 +234,11 @@ For more information on how to build a monitoring service for your StarRocks clu
 - Unit: Count
 - Description: Number of Transparent Huge Pages used for metadata.
 
+## `jemalloc_muzzy_bytes`
+
+- Unit: Bytes
+- Description: Total number of bytes in unused muzzy pages, an intermediate decay state between dirty and retained where the pages have been `madvise`d (for example with `MADV_FREE`) but the mapping is still retained.
+
 ## `jemalloc_resident_bytes`
 
 - Unit: Bytes
@@ -274,6 +253,97 @@ For more information on how to build a monitoring service for your StarRocks clu
 
 - Unit: Bytes
 - Description: Memory used by jit compiled function cache.
+
+## `lake_compaction_held_segment_bytes`
+
+- Unit: Bytes
+- Type: Instantaneous
+- Description: Segment metadata currently pinned by running lake compaction tasks that hold their input segments (`lake_compaction_hold_input_segments`). Unlike the metadata cache, this memory is not managed by an LRU and is released when the holding task ends, so a persistently high value indicates long-running compactions rather than a cache that needs resizing.
+
+## `lake_compaction_failed`
+
+- Unit: Count
+- Description: Counter of failed lake compaction jobs.
+
+## `lake_compaction_partial_success`
+
+- Unit: Count
+- Description: Counter of partially successful lake compaction jobs.
+
+## `lake_compaction_running`
+
+- Unit: Count
+- Description: Number of currently running lake compaction jobs.
+
+## `lake_compaction_running_tasks`
+
+- Unit: Count
+- Description: Number of tablets currently being compacted across all running shared-data (lake) compaction jobs. This is the same unit the scheduler caps with the `lake_compaction_max_tasks` config, and is finer-grained than `lake_compaction_running`, which counts compaction jobs (one per partition) — a single job fans out into one tablet-level task per tablet. Carries an `is_leader` label; follower FEs export the metric with `is_leader="false"` and value 0, so dashboards should filter on `is_leader="true"`.
+
+## `lake_compaction_score_at_trigger`
+
+- Unit: Score
+- Type: Gauge
+- Description: Compaction score of the most recent partition that triggered a lake compaction job, rounded to the nearest integer. The value is the partition's *max* tablet-level score (`Quantiles.getMax()`), matching the criterion the scheduler uses to pick partitions for compaction. Updated once per partition per trigger; the gauge holds the value of the most recent update. This gauge does not decay: on the leader FE, when no compactions are running it retains the last trigger's value (it is not reset to 0). The value is process-local (an in-memory counter on the leader, not persisted), so after an FE leader failover the newly promoted leader starts at 0 and reports 0 until its first compaction trigger — it does not inherit the previous leader's value. Alert on it together with `lake_compaction_running > 0` rather than reading it in isolation. Carries an `is_leader` label; follower FEs export `is_leader="false"` and return 0, so dashboards should filter on `is_leader="true"`.
+
+## `lake_compaction_success`
+
+- Unit: Count
+- Description: Counter of successful lake compaction jobs.
+
+## `lake_pk_index_cache_delvec_bytes`
+
+- Unit: Bytes
+- Type: Instantaneous
+- Description: Shared-data only. Memory used by the delete vectors attached to the Primary Key index SST files of the tablets whose Primary Key index is cached on this BE. Only SST files ingested together with a delete vector, such as compaction output, carry one. This memory is not charged to the Primary Key index cache, so `INDEX_MEM` in `information_schema.be_tablets` does not include it.
+
+## `lake_pk_index_cache_filter_bytes`
+
+- Unit: Bytes
+- Type: Instantaneous
+- Description: Shared-data only. Memory used by the Bloom filters of the Primary Key index SST files of the tablets whose Primary Key index is cached on this BE. `lake_pk_index_cache_memtable_bytes`, `lake_pk_index_cache_index_block_bytes`, and this metric add up to the memory charged to the Primary Key index cache, which `INDEX_MEM` in `information_schema.be_tablets` reports per tablet.
+
+## `lake_pk_index_cache_hit_total`
+
+- Unit: Count
+- Type: Cumulative
+- Description: Shared-data only. Number of times a publish on a Primary Key table found the tablet's Primary Key index already loaded in the Primary Key index cache. Together with `lake_pk_index_load_total`, the hit ratio of the cache is `hit / (hit + load)`.
+
+## `lake_pk_index_cache_index_block_bytes`
+
+- Unit: Bytes
+- Type: Instantaneous
+- Description: Shared-data only. Memory used by the index blocks of the Primary Key index SST files of the tablets whose Primary Key index is cached on this BE. `lake_pk_index_cache_memtable_bytes`, `lake_pk_index_cache_filter_bytes`, and this metric add up to the memory charged to the Primary Key index cache, which `INDEX_MEM` in `information_schema.be_tablets` reports per tablet.
+
+## `lake_pk_index_cache_memtable_bytes`
+
+- Unit: Bytes
+- Type: Instantaneous
+- Description: Shared-data only. Memory used by the MemTables, both active and being flushed, of the Primary Key indexes cached on this BE. `lake_pk_index_cache_index_block_bytes`, `lake_pk_index_cache_filter_bytes`, and this metric add up to the memory charged to the Primary Key index cache, which `INDEX_MEM` in `information_schema.be_tablets` reports per tablet.
+
+## `lake_pk_index_load_duration_us`
+
+- Unit: us
+- Type: Cumulative
+- Description: Shared-data only. Total time spent on the Primary Key index loads counted by `lake_pk_index_load_total`. Divide it by `lake_pk_index_load_total` to get the average time to load the index of one tablet.
+
+## `lake_pk_index_load_total`
+
+- Unit: Count
+- Type: Cumulative
+- Description: Shared-data only. Number of times a publish on a Primary Key table had to load the whole Primary Key index of a tablet because the index was not in the Primary Key index cache, either because it had not been loaded since the BE started or because it had been evicted. A load opens all Primary Key index SST files of the tablet and replays the rowsets those files do not cover yet. Failed loads are also counted. If this value keeps rising while the set of tablets being loaded into does not change, indexes are being evicted and loaded again.
+
+## `lake_tablet_location_handoff_entries`
+
+- Unit: Count
+- Type: Instantaneous
+- Description: Shared-data only. Number of tablet storage locations this BE holds for tablets it does not own, as handed over by their owners for writing combined transaction logs (see the BE configuration item `lake_enable_tablet_location_handoff`). They are kept in an LRU cache of 16 MiB: an entry is used for five minutes after its last refresh and is evicted when the cache needs room, so the value reflects cache occupancy rather than whether the handoff is in use.
+
+## `lake_tablet_location_handoff_hits_total`
+
+- Unit: Count
+- Type: Cumulative
+- Description: Shared-data only. Number of times this BE resolved the storage location of a tablet it does not own from a location handed over by the tablet's owner instead of requesting it from StarMgr. Each increment is one StarMgr GetShard RPC avoided. It rises on the nodes that coordinate loads into tables with `file_bundling` enabled. Together with `staros_shard_info_fallback_total`, the share answered by the handoff is `hits / (hits + fallback)`.
 
 ## `lake_vacuum_del_file_batch_size_minute`
 
@@ -312,7 +382,55 @@ For more information on how to build a monitoring service for your StarRocks clu
 - Unit: Count
 - Description: The current size of the RPC thread pool, which is used for handling Routine Load and loading via table functions. The default value is 10, with a maximum value of 1000. This value is dynamically adjusted based on the usage of the thread pool.
 
+## `load_sink_close_active_threads`
+
+- Unit: Count
+- Type: Instantaneous
+- Description: The number of load sink closes that are running in the load sink close thread pool. In a shared-data cluster, each close writes the combined transaction log of a load to object storage.
+
+## `load_sink_close_execute_time_ns_total`
+
+- Unit: Nanoseconds
+- Type: Cumulative
+- Description: The total execution time of completed load sink close tasks, including waits and object-storage writes performed during close. Updated when each task finishes.
+
+## `load_sink_close_executed_tasks_total`
+
+- Unit: Count
+- Type: Cumulative
+- Description: The number of load sink close tasks completed by the thread pool, including closes that return an error.
+
+## `load_sink_close_pending_time_ns_total`
+
+- Unit: Nanoseconds
+- Type: Cumulative
+- Description: The total time completed load sink close tasks spent waiting in the thread pool queue. Updated when each task finishes; currently queued tasks are not yet included.
+
+## `load_sink_close_queue_count`
+
+- Unit: Count
+- Type: Instantaneous
+- Description: The number of load sink closes waiting in the queue of the load sink close thread pool. A value that keeps growing means object-storage writes are slower than loads finish.
+
+## `load_sink_close_running_threads`
+
+- Unit: Count
+- Type: Instantaneous
+- Description: The number of threads in the load sink close thread pool.
+
+## `load_sink_close_threadpool_size`
+
+- Unit: Count
+- Type: Instantaneous
+- Description: The maximum number of threads in the load sink close thread pool, set by `load_sink_close_thread_pool_num_max`.
+
 ## `local_column_pool_bytes (Deprecated)`
+
+## `low_cardinality_dict_cache_bytes`
+
+- Unit: Bytes
+- Type: Gauge
+- Description: Total byte size of cached dictionary data in the low-cardinality global dictionary cache (`CacheDictManager`) on this FE. Tracked exactly by the cache (not sampled); it counts serialized dictionary data, which is a lower bound on the actual heap footprint. The cache is bounded by this size via the `low_cardinality_dict_cache_max_bytes` configuration.
 
 ## `max_disk_io_util_percent`
 
@@ -439,6 +557,12 @@ Latency metrics expose percentile series such as `merge_commit_request_latency_9
 - Type: Summary
 - Description: Combined latency for the RPC request and waiting for the stream load pipe to become available.
 
+## `meta_replay_lag_second`
+
+- Unit: Seconds
+- Type: Gauge
+- Description: How far the metadata replayed by this FE lags behind the Leader's clock. The Leader FE writes a timestamp into the journal every 10 seconds, and this metric is the age of the most recent timestamp that this node has replayed. Unlike `max_journal_replay_lag`, which only the Leader reports, this metric is reported by the lagging node itself, and it keeps growing while a single journal entry is stuck in replay. The Leader FE always reports `0`, because it writes the timestamps instead of replaying them. Once this value exceeds `meta_delay_toleration_second`, the node stops serving reads from its own metadata and forwards its queries to the Leader. Two cases are exempt: reads continue while `ignore_meta_check` is `true`, and a node that has replayed nothing since the previous check keeps whatever read availability it already had, unless it has also lost contact with the Leader, because falling behind a Leader that is writing nothing says nothing about this node. This second case only stops a node from being taken out of service; it never returns one that has already stopped serving.
+
 ## `meta_request_duration`
 
 - Unit: us
@@ -524,10 +648,27 @@ Latency metrics expose percentile series such as `merge_commit_request_latency_9
 - Unit: Count
 - Description: Cumulative number of driver scheduling times for pipeline executors in the BE.
 
+## `pipe_drivers`
+
+- Unit: Count
+- Description: Current logical driver capacity reserved by BE admission control. Includes reservations held while a fragment instantiates drivers and operators, as well as reservations retained after instantiation until they are released. The value follows logical DOP accounting, including colocate execution groups, and is not a count of instantiated driver objects or running threads. Releasing a reservation, including on preparation failure or fragment completion, decreases the value.
+
 ## `pipe_poller_block_queue_len`
 
 - Unit: Count
 - Description: Current length of the block queue of PipelineDriverPoller in the pipeline engine.
+
+## `pipe_poller_max_driver_check`
+
+- Unit: microsecond
+- Type: Summary
+- Description: Time taken by the slowest single driver check in one pass of PipelineDriverPoller. A large value means that checking one blocked driver held up the whole pass.
+
+## `pipe_poller_pass`
+
+- Unit: microsecond
+- Type: Summary
+- Description: Time taken by one pass of PipelineDriverPoller over its blocked drivers. Each executor set has a single poller thread, so a long pass delays every driver that waits on it. The maximum in the recent window is exposed as `pipe_poller_pass_max_latency`.
 
 ## `pipe_prepare_pool_queue_len`
 
@@ -548,7 +689,7 @@ Latency metrics expose percentile series such as `merge_commit_request_latency_9
 
 - Type: Counter
 - Unit: Count
-- Description: Total number of SST file read failures in the lake Primary Key persistent index. Incremented when SST multi-get (read) operations fail.
+- Description: Total number of SST file read failures in the lake Primary Key persistent index. Incremented when SST multi-get (read) operations fail, or when compaction detects data corruption while reading input SST files.
 
 ## `pk_index_sst_write_error_total`
 

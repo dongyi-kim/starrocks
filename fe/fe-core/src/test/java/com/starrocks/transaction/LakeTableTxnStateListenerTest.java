@@ -52,12 +52,13 @@ public class LakeTableTxnStateListenerTest extends LakeTableTestHelper {
         DatabaseTransactionMgr databaseTransactionMgr = addDatabaseTransactionMgr();
         LakeTableTxnStateListener listener = new LakeTableTxnStateListener(databaseTransactionMgr, table);
         TransactionCommitFailedException exception = Assertions.assertThrows(TransactionCommitFailedException.class,
-                () -> listener.preCommit(newTransactionState(), buildPartialTabletCommitInfo(), Collections.emptyList()));
+                () -> listener.prePrepared(
+                        newTransactionState(), buildPartialTabletCommitInfo(), Collections.emptyList()));
         Assertions.assertTrue(exception.getMessage().contains("has unfinished tablets"));
     }
 
     @Test
-    public void testCommitRateExceeded() {
+    public void testCommitRateExceededAtFinalCommit() throws TransactionException {
         new MockUp<LakeTableTxnStateListener>() {
             @Mock
             boolean enableIngestSlowdown() {
@@ -69,8 +70,20 @@ public class LakeTableTxnStateListenerTest extends LakeTableTestHelper {
         DatabaseTransactionMgr databaseTransactionMgr = addDatabaseTransactionMgr();
         LakeTableTxnStateListener listener = new LakeTableTxnStateListener(databaseTransactionMgr, table);
         makeCompactionScoreExceedSlowdownThreshold();
+        TransactionState txnState = prepareTransactionState(listener);
+
+        LakeTableTxnStateListener commitListener = new LakeTableTxnStateListener(databaseTransactionMgr, table);
         Assertions.assertThrows(CommitRateExceededException.class,
-                () -> listener.preCommit(newTransactionState(), buildFullTabletCommitInfo(), Collections.emptyList()));
+                () -> commitListener.preCommit(txnState));
+        Assertions.assertTrue(txnState.getReason().contains("delay commit"));
+
+        txnState.setAllowCommitTimeMs(System.currentTimeMillis() - 1);
+        commitListener.preCommit(txnState);
+        Assertions.assertEquals("", txnState.getReason());
+
+        TransactionState committedState = new TransactionState(txnState);
+        committedState.setTransactionStatus(TransactionStatus.COMMITTED);
+        Assertions.assertEquals("", committedState.getReason());
     }
 
     @Test
@@ -86,7 +99,10 @@ public class LakeTableTxnStateListenerTest extends LakeTableTestHelper {
         DatabaseTransactionMgr databaseTransactionMgr = addDatabaseTransactionMgr();
         LakeTableTxnStateListener listener = new LakeTableTxnStateListener(databaseTransactionMgr, table);
         makeCompactionScoreExceedSlowdownThreshold();
-        listener.preCommit(newTransactionState(), buildFullTabletCommitInfo(), Collections.emptyList());
+        TransactionState txnState = prepareTransactionState(listener);
+
+        LakeTableTxnStateListener commitListener = new LakeTableTxnStateListener(databaseTransactionMgr, table);
+        commitListener.preCommit(txnState);
     }
 
     @ParameterizedTest
@@ -124,11 +140,11 @@ public class LakeTableTxnStateListenerTest extends LakeTableTestHelper {
     }
 
     /**
-     * Verifies that compaction preCommit succeeds after tablet split when loaded indexes are registered.
-     * Simulates: compaction collects I_old tablets → tablet split adds I_new → preCommit validates I_old.
+     * Verifies that compaction prePrepared succeeds after tablet split when loaded indexes are registered.
+     * Simulates: compaction collects I_old tablets → tablet split adds I_new → prePrepared validates I_old.
      */
     @Test
-    public void testCompactionPreCommitWithTabletSplitAndRegisteredIndexes() throws TransactionException {
+    public void testCompactionPrePreparedWithTabletSplitAndRegisteredIndexes() throws TransactionException {
         // Build table with I_old (1 tablet)
         long oldIndexId = 20001;
         long oldTabletId = 20002;
@@ -164,18 +180,18 @@ public class LakeTableTxnStateListenerTest extends LakeTableTestHelper {
         List<TabletCommitInfo> finishedTablets = new ArrayList<>();
         finishedTablets.add(new TabletCommitInfo(oldTabletId, 1));
 
-        // preCommit should succeed because it validates I_old (registered), not I_new (latest)
+        // prePrepared should succeed because it validates I_old (registered), not I_new (latest)
         DatabaseTransactionMgr databaseTransactionMgr = addDatabaseTransactionMgr();
         LakeTableTxnStateListener listener = new LakeTableTxnStateListener(databaseTransactionMgr, table);
-        listener.preCommit(txnState, finishedTablets, Collections.emptyList());
+        listener.prePrepared(txnState, finishedTablets, Collections.emptyList());
     }
 
     /**
-     * Confirms the bug: without registering loaded indexes, compaction preCommit fails after tablet split
+     * Confirms the bug: without registering loaded indexes, compaction prePrepared fails after tablet split
      * because it falls back to the latest index (I_new) whose tablets are not in finishedTablets.
      */
     @Test
-    public void testCompactionPreCommitWithTabletSplitWithoutRegisteredIndexes() {
+    public void testCompactionPrePreparedWithTabletSplitWithoutRegisteredIndexes() {
         // Build table with I_old (1 tablet)
         long oldIndexId = 30001;
         long oldTabletId = 30002;
@@ -208,20 +224,115 @@ public class LakeTableTxnStateListenerTest extends LakeTableTestHelper {
         List<TabletCommitInfo> finishedTablets = new ArrayList<>();
         finishedTablets.add(new TabletCommitInfo(oldTabletId, 1));
 
-        // preCommit should FAIL because it falls back to I_new (latest), whose tablets are not finished
+        // prePrepared should FAIL because it falls back to I_new (latest), whose tablets are not finished
         DatabaseTransactionMgr databaseTransactionMgr = addDatabaseTransactionMgr();
         LakeTableTxnStateListener listener = new LakeTableTxnStateListener(databaseTransactionMgr, table);
         TransactionCommitFailedException exception = Assertions.assertThrows(
                 TransactionCommitFailedException.class,
-                () -> listener.preCommit(txnState, finishedTablets, Collections.emptyList()));
+                () -> listener.prePrepared(txnState, finishedTablets, Collections.emptyList()));
         Assertions.assertTrue(exception.getMessage().contains("has unfinished tablets"));
+    }
+
+    /**
+     * A transaction drawn at or after an alter's watershed must write the shadow index. One whose recorded
+     * index set lacks it resolved tablets before the index existed (replication, a bypass-write client with
+     * cached metadata) and is rejected. The shadow index here keeps visibleTxnId at 0, as LakeRollupJob's
+     * does, so the check relies only on the watershed stamp.
+     */
+    @Test
+    public void testRejectTxnAtOrAfterWatershedMissingShadowIndex() {
+        LakeTable table = buildLakeTableWithShadowIndex(40001, 40002, 9000);
+        TransactionState txnState = newTransactionState(); // txn id 10000 >= watershed 9000
+        txnState.addPartitionLoadedIndexes(tableId, physicalPartitionId, Lists.newArrayList(indexId));
+
+        LakeTableTxnStateListener listener = new LakeTableTxnStateListener(addDatabaseTransactionMgr(), table);
+        TransactionCommitFailedException exception = Assertions.assertThrows(TransactionCommitFailedException.class,
+                () -> listener.prePrepared(txnState, buildFullTabletCommitInfo(), Collections.emptyList()));
+        Assertions.assertTrue(exception.getMessage().contains("without shadow index 40001"), exception.getMessage());
+        Assertions.assertTrue(exception.getMessage().contains("since 9000"), exception.getMessage());
+    }
+
+    /**
+     * A transaction drawn before the watershed legitimately misses the shadow index: the alter waits for it
+     * and its rows reach the shadow index through the conversion.
+     */
+    @Test
+    public void testAcceptTxnBeforeWatershedMissingShadowIndex() throws TransactionException {
+        LakeTable table = buildLakeTableWithShadowIndex(40011, 40012, 20000);
+        TransactionState txnState = newTransactionState(); // txn id 10000 < watershed 20000
+        txnState.addPartitionLoadedIndexes(tableId, physicalPartitionId, Lists.newArrayList(indexId));
+
+        LakeTableTxnStateListener listener = new LakeTableTxnStateListener(addDatabaseTransactionMgr(), table);
+        listener.prePrepared(txnState, buildFullTabletCommitInfo(), Collections.emptyList());
+    }
+
+    @Test
+    public void testAcceptTxnCarryingShadowIndex() throws TransactionException {
+        LakeTable table = buildLakeTableWithShadowIndex(40021, 40022, 9000);
+        TransactionState txnState = newTransactionState();
+        txnState.addPartitionLoadedIndexes(tableId, physicalPartitionId, Lists.newArrayList(indexId, 40021L));
+        List<TabletCommitInfo> finishedTablets = buildFullTabletCommitInfo();
+        finishedTablets.add(new TabletCommitInfo(40022, 1));
+
+        LakeTableTxnStateListener listener = new LakeTableTxnStateListener(addDatabaseTransactionMgr(), table);
+        listener.prePrepared(txnState, finishedTablets, Collections.emptyList());
+    }
+
+    /**
+     * A shadow index exposed by an FE without the watershed stamp is not checked.
+     */
+    @Test
+    public void testUnstampedShadowIndexIsNotChecked() throws TransactionException {
+        LakeTable table = buildLakeTableWithShadowIndex(40031, 40032, 0);
+        TransactionState txnState = newTransactionState();
+        txnState.addPartitionLoadedIndexes(tableId, physicalPartitionId, Lists.newArrayList(indexId));
+
+        LakeTableTxnStateListener listener = new LakeTableTxnStateListener(addDatabaseTransactionMgr(), table);
+        listener.prePrepared(txnState, buildFullTabletCommitInfo(), Collections.emptyList());
+    }
+
+    /**
+     * Lake compaction compacts only visible tablets by design, so it is not held to the shadow index.
+     */
+    @Test
+    public void testCompactionIsNotChecked() throws TransactionException {
+        LakeTable table = buildLakeTableWithShadowIndex(40041, 40042, 9000);
+        TransactionState txnState = newCompactionTransactionState();
+        txnState.addPartitionLoadedIndexes(tableId, physicalPartitionId, Lists.newArrayList(indexId));
+
+        LakeTableTxnStateListener listener = new LakeTableTxnStateListener(addDatabaseTransactionMgr(), table);
+        listener.prePrepared(txnState, buildFullTabletCommitInfo(), Collections.emptyList());
+    }
+
+    private LakeTable buildLakeTableWithShadowIndex(long shadowIndexId, long shadowTabletId, long shadowWatershedTxnId) {
+        LakeTable table = buildLakeTable();
+        PhysicalPartition partition = table.getPhysicalPartition(physicalPartitionId);
+        MaterializedIndex shadowIndex = new MaterializedIndex(shadowIndexId, MaterializedIndex.IndexState.SHADOW);
+        TabletMeta tabletMeta = new TabletMeta(dbId, tableId, physicalPartitionId, shadowIndexId, TStorageMedium.HDD, true);
+        GlobalStateMgr.getCurrentState().getTabletInvertedIndex().addTablet(shadowTabletId, tabletMeta);
+        shadowIndex.addTablet(new LakeTablet(shadowTabletId), tabletMeta);
+        if (shadowWatershedTxnId > 0) {
+            shadowIndex.setShadowWatershedTxnId(shadowWatershedTxnId);
+        }
+        partition.createRollupIndex(shadowIndex);
+        return table;
     }
 
     private void makeCompactionScoreExceedSlowdownThreshold() {
         long currentTimeMs = System.currentTimeMillis();
         CompactionMgr compactionMgr = GlobalStateMgr.getCurrentState().getCompactionMgr();
-        compactionMgr.handleLoadingFinished(new PartitionIdentifier(dbId, tableId, partitionId), 3, currentTimeMs,
+        compactionMgr.handleLoadingFinished(new PartitionIdentifier(dbId, tableId, physicalPartitionId), 3, currentTimeMs,
                 Quantiles.compute(Lists.newArrayList(Config.lake_ingest_slowdown_threshold + 10.0)));
+    }
+
+    private TransactionState prepareTransactionState(LakeTableTxnStateListener listener) throws TransactionException {
+        TransactionState txnState = newTransactionState();
+        listener.prePrepared(txnState, buildFullTabletCommitInfo(), Collections.emptyList());
+        txnState.setTransactionStatus(TransactionStatus.PREPARED);
+        txnState.setPreparedTimeAndTimeout(
+                System.currentTimeMillis(), TransactionState.DEFAULT_PREPARED_TIMEOUT_MS);
+        listener.preWriteCommitLog(txnState);
+        return txnState;
     }
 
     private static Stream<Arguments> dataProvider() {

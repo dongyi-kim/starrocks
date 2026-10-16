@@ -40,6 +40,7 @@ import com.starrocks.metric.GaugeMetric;
 import com.starrocks.metric.Metric.MetricUnit;
 import com.starrocks.metric.MetricLabel;
 import com.starrocks.metric.MetricRepo;
+import com.starrocks.server.GlobalStateMgr;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -83,6 +84,10 @@ public class ThreadPoolManager {
             "completed_task_count"};
 
     private static final long KEEP_ALIVE_TIME = 60L;
+
+    private static boolean shouldRegisterMetric(boolean needRegisterMetric) {
+        return needRegisterMetric && !GlobalStateMgr.isCheckpointThread();
+    }
 
     private static final ThreadPoolExecutor STATS_CACHE_THREAD_POOL =
             ThreadPoolManager.newCollectThreadPool(Config.dict_collect_thread_pool_size, "cache-stats"
@@ -152,9 +157,14 @@ public class ThreadPoolManager {
 
     public static ThreadPoolExecutor newDaemonCacheThreadPool(int maxNumThread, int queueSize, String poolName,
                                                               boolean needRegisterMetric) {
-        return newDaemonThreadPool(0, maxNumThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>(queueSize),
+        // ThreadPoolExecutor adds threads beyond the core size only when the queue is full, so set
+        // core == max to run up to maxNumThread tasks before queueing. Core threads time out too,
+        // so an idle pool still shrinks to zero threads.
+        ThreadPoolExecutor threadPool = newDaemonThreadPool(maxNumThread, maxNumThread, KEEP_ALIVE_TIME,
+                TimeUnit.SECONDS, new LinkedBlockingQueue<>(queueSize),
                 new BlockedPolicy(poolName, 5), poolName, needRegisterMetric);
+        threadPool.allowCoreThreadTimeOut(true);
+        return threadPool;
     }
 
     public static ThreadPoolExecutor newDaemonFixedThreadPool(int numThread, int queueSize, String poolName,
@@ -162,6 +172,13 @@ public class ThreadPoolManager {
         return newDaemonThreadPool(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(queueSize),
                 new BlockedPolicy(poolName, 60), poolName, needRegisterMetric);
+    }
+
+    public static ThreadPoolExecutor newDaemonFixedThreadPoolWithAbortPolicy(
+            int numThread, int queueSize, String poolName, boolean needRegisterMetric) {
+        return newDaemonThreadPool(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(queueSize),
+                new FastAbortPolicy(), poolName, needRegisterMetric);
     }
 
     public static ThreadPoolExecutor newDaemonFixedThreadPoolWithUnboundedQueue(int numThread, String poolName,
@@ -177,7 +194,7 @@ public class ThreadPoolManager {
         PriorityThreadPoolExecutor threadPool = new PriorityThreadPoolExecutor(numThread, numThread, 0,
                 TimeUnit.SECONDS, new PriorityBlockingQueue<>(queueSize), threadFactory,
                 new BlockedPolicy(poolName, 60));
-        if (needRegisterMetric) {
+        if (shouldRegisterMetric(needRegisterMetric)) {
             nameToThreadPoolMap.put(poolName, threadPool);
         }
         return threadPool;
@@ -195,7 +212,7 @@ public class ThreadPoolManager {
         ThreadPoolExecutor threadPool =
                 new ThreadPoolExecutor(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory,
                         handler);
-        if (needRegisterMetric) {
+        if (shouldRegisterMetric(needRegisterMetric)) {
             nameToThreadPoolMap.put(poolName, threadPool);
         }
         return threadPool;
@@ -209,7 +226,7 @@ public class ThreadPoolManager {
         ThreadFactory threadFactory = namedThreadFactory(poolName);
         ScheduledThreadPoolExecutor scheduledThreadPoolExecutor =
                 new ScheduledThreadPoolExecutor(corePoolSize, threadFactory);
-        if (needRegisterMetric) {
+        if (shouldRegisterMetric(needRegisterMetric)) {
             nameToThreadPoolMap.put(poolName, scheduledThreadPoolExecutor);
         }
         return scheduledThreadPoolExecutor;
@@ -220,6 +237,35 @@ public class ThreadPoolManager {
      */
     private static ThreadFactory namedThreadFactory(String poolName) {
         return new ThreadFactoryBuilder().setDaemon(true).setNameFormat(poolName + "-%d").build();
+    }
+
+    /**
+     * A handler for rejected task that fails the submission immediately and says nothing, used for a pool
+     * whose caller reports the rejection itself.
+     * <p>
+     * {@link ThreadPoolExecutor.AbortPolicy} composes its message from {@link ThreadPoolExecutor#toString()},
+     * which takes the pool's mainLock and walks every worker to tally completed tasks. On a saturated pool
+     * that is thousands of iterations under the same lock {@code addWorker} and {@code processWorkerExit}
+     * need, paid per rejected task, to build a string a caller that logs its own message never reads.
+     */
+    static class FastAbortPolicy implements RejectedExecutionHandler {
+
+        @Override
+        public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
+            throw new StacklessRejectedExecutionException();
+        }
+
+        /**
+         * Skips the stack-trace capture, which dominates the cost of throwing and is the last thing
+         * left to pay for once the message is gone. Nothing prints this trace: the caller logs its
+         * own message and discards the exception.
+         */
+        private static class StacklessRejectedExecutionException extends RejectedExecutionException {
+            @Override
+            public synchronized Throwable fillInStackTrace() {
+                return this;
+            }
+        }
     }
 
     /**
@@ -316,4 +362,3 @@ public class ThreadPoolManager {
         return Integer.max(2, cpuCores() * 3 / 4);
     }
 }
-

@@ -19,33 +19,38 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.catalog.AggregateFunction;
 import com.starrocks.catalog.Function;
+import com.starrocks.catalog.FunctionName;
 import com.starrocks.catalog.FunctionSet;
 import com.starrocks.sql.ast.expression.ExprUtils;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.Operator;
+import com.starrocks.sql.optimizer.operator.scalar.ArrayOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CollectionElementOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
 import com.starrocks.sql.optimizer.operator.scalar.DictMappingOperator;
-import com.starrocks.sql.optimizer.operator.scalar.IsNullPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.operator.scalar.SubfieldOperator;
 import com.starrocks.sql.optimizer.rewrite.BaseScalarOperatorShuttle;
 import com.starrocks.sql.optimizer.statistics.ColumnDict;
+import com.starrocks.thrift.TFunctionBinaryType;
 import com.starrocks.type.ArrayType;
 import com.starrocks.type.IntegerType;
 import com.starrocks.type.StructField;
 import com.starrocks.type.StructType;
 import com.starrocks.type.Type;
+import com.starrocks.type.VarcharType;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import static com.starrocks.sql.optimizer.rule.tree.lowcardinality.DecodeCollector.LOW_CARD_ARRAY_FUNCTIONS;
 import static com.starrocks.sql.optimizer.rule.tree.lowcardinality.DecodeCollector.LOW_CARD_STRUCT_FUNCTIONS;
@@ -178,30 +183,7 @@ class DecodeContext {
         }
     }
 
-    private boolean isNullSensitiveToRef(ScalarOperator op, int refId) {
-        if (!op.getUsedColumns().contains(refId)) {
-            return false;
-        }
-        if (op instanceof IsNullPredicateOperator) {
-            return true;
-        }
-        if (op instanceof CallOperator) {
-            String fn = ((CallOperator) op).getFnName();
-            if (FunctionSet.IFNULL.equalsIgnoreCase(fn) || FunctionSet.COALESCE.equalsIgnoreCase(fn)
-                    || FunctionSet.NULLIF.equalsIgnoreCase(fn) || FunctionSet.CONCAT_WS.equalsIgnoreCase(fn)) {
-                return true;
-            }
-        }
-        for (ScalarOperator child : op.getChildren()) {
-            if (isNullSensitiveToRef(child, refId)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     private void rewriteGlobalDict() {
-        GlobalDictRewriter dictRewriter = new GlobalDictRewriter();
         for (Integer stringId : stringRefToDefineExprMap.keySet()) {
             if (stringRefToDicts.containsKey(stringId)) {
                 continue;
@@ -218,22 +200,20 @@ class DecodeContext {
             }
             ScalarOperator stringDefineExpr = stringRefToDefineExprMap.get(stringId);
 
-            // Check before flattening: if a NULL-sensitive expression is built on a DERIVED dict
-            // (one defined by another expression, not a base column), do NOT flatten it through the
-            // child define. Keep it referencing the intermediate dict directly, so producer and
-            // consumer build the dictionary the same way (a derived dict carries a synthetic NULL
-            // code that flattening would drop).
-            ColumnRefOperator keepUseRef = getUseStringRef(stringDefineExpr);
-            if (keepUseRef != null && !stringRefToDicts.containsKey(keepUseRef.getId())
-                    && stringRefToDefineExprMap.containsKey(keepUseRef.getId())
-                    && isNullSensitiveToRef(stringDefineExpr, keepUseRef.getId())) {
-                ColumnRefOperator keepDictRef = stringRefToDictRefMap.get(keepUseRef);
-                globalDictsExpr.put(dictRef.getId(),
-                        new DictMappingOperator(keepDictRef, stringDefineExpr.clone(), dictRef.getType()));
-                continue;
-            }
-
-            ScalarOperator defineExpr = stringDefineExpr.accept(dictRewriter, null);
+            // Folding through a column is only valid when that column's codes are the codes of the
+            // column we fold onto. BE derives a dictionary by evaluating the define expression over
+            // the input dictionary, then de-duplicating and sorting the results (codes 1..n). So a
+            // column defined by a real expression (B : lower(C)) has its own code space that is not
+            // C's, and folding A through it (dictMapping(C, upper(lower(C)))) makes the fragment that
+            // receives B's codes (e.g. across an exchange, after a distinct aggregation) look them up
+            // in a mapping built for C's codes: the values no longer line up ("Dict Decode failed").
+            // Stop the fold at such a column and define A over B's dictionary instead. Only columns
+            // whose define reduces to a plain column reference (aliases, min/max, array element, ...)
+            // share the code space of their source and stay foldable.
+            ColumnRefOperator useStringRef = getUseStringRef(stringDefineExpr);
+            int stopStringId = useStringRef != null && hasOwnDictCodes(useStringRef.getId())
+                    ? useStringRef.getId() : -1;
+            ScalarOperator defineExpr = stringDefineExpr.accept(new GlobalDictRewriter(stopStringId), null);
             List<ColumnRefOperator> defineUsedStringRef = defineExpr.getColumnRefs();
             Preconditions.checkState(!defineUsedStringRef.isEmpty());
 
@@ -241,6 +221,16 @@ class DecodeContext {
             ScalarOperator globalDictExpr = new DictMappingOperator(defineUsedDictRef, defineExpr, dictRef.getType());
             globalDictsExpr.put(dictRef.getId(), globalDictExpr);
         }
+    }
+
+    // Whether the string column's dictionary codes are its own (built by BE from a define
+    // expression) rather than the codes of the base column it is ultimately derived from.
+    private boolean hasOwnDictCodes(int stringId) {
+        if (stringRefToDicts.containsKey(stringId) || !stringRefToDefineExprMap.containsKey(stringId)) {
+            return false;
+        }
+        ScalarOperator folded = stringRefToDefineExprMap.get(stringId).accept(new GlobalDictRewriter(-1), null);
+        return !folded.isColumnRef();
     }
 
     private void rewriteStringExpressions() {
@@ -301,6 +291,37 @@ class DecodeContext {
         } else {
             throw new IllegalArgumentException("Unsupported dictified type: " +  column.getType());
         }
+    }
+
+    private static final String DICT_ENCODE = "dict_encode";
+    private static final Function DICT_ENCODE_FN = new Function(
+            30700, new FunctionName(DICT_ENCODE), List.of(VarcharType.VARCHAR, IntegerType.INT), IntegerType.INT, false);
+    static {
+        DICT_ENCODE_FN.setBinaryType(TFunctionBinaryType.BUILTIN);
+    }
+
+    private static ScalarOperator dictEncodeConstant(ScalarOperator constant, int dictId) {
+        if (!constant.getType().isStringType() && !constant.getType().isStringArrayType()) {
+            return constant;
+        }
+        ConstantOperator dictSlotConstant = ConstantOperator.createInt(dictId);
+        if (constant instanceof ConstantOperator constantOp) {
+            if (constantOp.getType().isStringType()) {
+                return new CallOperator(
+                        DICT_ENCODE, IntegerType.INT, List.of(constant, dictSlotConstant), DICT_ENCODE_FN);
+            }
+            Preconditions.checkState(constantOp.isNull());
+            return ConstantOperator.createNull(ArrayType.ARRAY_INT);
+        }
+        if (constant instanceof ArrayOperator arrayOp) {
+            Preconditions.checkState(arrayOp.getChildren().stream().allMatch(ScalarOperator::isConstantRef));
+            return new ArrayOperator(ArrayType.ARRAY_INT, arrayOp.isNullable(),
+                    arrayOp.getChildren().stream().map(k -> (ScalarOperator) new CallOperator(
+                                    DICT_ENCODE, IntegerType.INT, List.of(k, dictSlotConstant), DICT_ENCODE_FN))
+                            .collect(Collectors.toCollection(ArrayList::new)));
+        }
+        throw new IllegalArgumentException("Invalid constant argument for array function: " + constant);
+
     }
 
     private static Function buildFunction(String fnName, List<ScalarOperator> args) {
@@ -440,6 +461,13 @@ class DecodeContext {
                 return call;
             }
 
+            if (isSupportedArrayFunction(call)) {
+                ColumnRefOperator stringRef = getUseStringRef(call);
+                ColumnRefOperator dictRef = stringRefToDictRefMap.get(stringRef);
+                Preconditions.checkNotNull(dictRef);
+                newChildren = newChildren.stream().map(op -> op.isConstant() ?
+                        dictEncodeConstant(op, dictRef.getId()) : op).collect(Collectors.toCollection(ArrayList::new));
+            }
             Function fn = buildFunction(call.getFnName(), newChildren);
             ScalarOperator result = new CallOperator(call.getFnName(), fn.getReturnType(), newChildren, fn);
 
@@ -599,11 +627,20 @@ class DecodeContext {
     }
 
     private class GlobalDictRewriter extends BaseScalarOperatorShuttle {
+        // string column at which folding stops: it is kept as the dict mapping's input column
+        // instead of being replaced by its own define expression (-1: fold down to the base column)
+        private final int stopStringId;
+
+        GlobalDictRewriter(int stopStringId) {
+            this.stopStringId = stopStringId;
+        }
+
         @Override
         public ScalarOperator visitVariableReference(ColumnRefOperator variable, Void ignore) {
             // string dict expression use origin string column
             ScalarOperator define = stringRefToDefineExprMap.get(variable.getId());
-            if (define.isColumnRef() && variable.getId() == ((ColumnRefOperator) define).getId()) {
+            if (variable.getId() == stopStringId
+                    || (define.isColumnRef() && variable.getId() == ((ColumnRefOperator) define).getId())) {
                 // mock to string column
                 return new ColumnRefOperator(variable.getId(), variable.getType(), variable.getName(),
                         variable.isNullable());

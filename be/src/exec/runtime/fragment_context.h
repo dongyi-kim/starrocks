@@ -174,7 +174,18 @@ public:
     bool enable_group_execution() const { return _enable_group_execution; }
     void set_enable_group_execution(bool enable_group_execution) { _enable_group_execution = enable_group_execution; }
 
+    // Whether the FE handed some scan of this instance its scan ranges per driver sequence. The FE makes that
+    // choice once per instance, and the same choice binds every bucket shuffle exchange sent to this instance to
+    // the driver owning each bucket; without it the sender spreads each bucket over the drivers by hash.
+    bool has_per_driver_scan_ranges() const { return _has_per_driver_scan_ranges; }
+    void set_has_per_driver_scan_ranges() { _has_per_driver_scan_ranges = true; }
+
     void set_report_when_finish(bool report) { _report_when_finish = report; }
+    // Optional event-driven completion hook. Set only for BE-local synchronous stream
+    // load (see orchestration::StreamLoadOrchestrator): invoked exactly once on the
+    // driver thread when all execution groups finish, so results can be harvested from
+    // runtime_state() without an FE coordinator. Empty for every other fragment.
+    void set_finish_cb(std::function<void(FragmentContext*)> cb) { _finish_cb = std::move(cb); }
 
     // acquire runtime filter from cache
     void acquire_runtime_filters();
@@ -187,6 +198,7 @@ private:
     void _close_fragment_attachments();
 
     bool _enable_group_execution = false;
+    bool _has_per_driver_scan_ranges = false;
     // Id of this query
     TUniqueId _query_id;
     // Id of this instance
@@ -206,6 +218,13 @@ private:
     std::unique_ptr<FragmentDictState> _fragment_dict_state;
     ExecNode* _plan = nullptr; // lives in _runtime_state->obj_pool()
     size_t _next_driver_id = 0;
+    // MorselQueueFactory must outlive the pipelines/operators declared below: a
+    // scan operator's ConnectorChunkSource::close() is invoked from ~ScanOperator
+    // during _pipelines teardown and calls back into the MorselQueueFactory via
+    // ScanOperatorFactory::morsel_queue_factory(). Declaring _morsel_queue_factories
+    // before _pipelines makes it destroyed after them, avoiding a use-after-free on
+    // non-EOF (cancel/error/limit) teardown paths.
+    MorselQueueFactoryMap _morsel_queue_factories;
     // Must outlive PipelineDriver observers owned by _pipelines.
     std::unique_ptr<EventScheduler> _event_scheduler;
     Pipelines _pipelines;
@@ -217,7 +236,6 @@ private:
     std::shared_ptr<PipelineTimerTask> _timeout_task = nullptr;
     std::shared_ptr<PipelineTimerTask> _report_state_task = nullptr;
 
-    MorselQueueFactoryMap _morsel_queue_factories;
     DriverLimiter::TokenPtr _driver_token = nullptr;
 
     std::unique_ptr<PassThroughChunkBufferGuard> _pass_through_chunk_buffer_guard;
@@ -229,6 +247,7 @@ private:
 
     size_t _expired_log_count = 0;
 
+    std::function<void(FragmentContext*)> _finish_cb;
     bool _report_when_finish{};
 };
 } // namespace pipeline

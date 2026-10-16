@@ -19,13 +19,64 @@ package com.starrocks.common;
 
 import com.starrocks.metric.Metric;
 import com.starrocks.metric.MetricRepo;
+import com.starrocks.server.GlobalStateMgr;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 public class ThreadPoolManagerTest {
+
+    @Test
+    public void testCheckpointThreadDoesNotBufferMetrics() throws Exception {
+        Field checkpointThreadIdField = GlobalStateMgr.class.getDeclaredField("checkpointThreadId");
+        checkpointThreadIdField.setAccessible(true);
+        long previousCheckpointThreadId = checkpointThreadIdField.getLong(null);
+
+        Field poolMapField = ThreadPoolManager.class.getDeclaredField("nameToThreadPoolMap");
+        poolMapField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, ThreadPoolExecutor> poolMap =
+                (Map<String, ThreadPoolExecutor>) poolMapField.get(null);
+
+        String daemonPoolName = "checkpoint-daemon-pool";
+        String priorityPoolName = "checkpoint-priority-pool";
+        String scheduledPoolName = "checkpoint-scheduled-pool";
+        ThreadPoolExecutor daemonPool = null;
+        PriorityThreadPoolExecutor priorityPool = null;
+        ScheduledThreadPoolExecutor scheduledPool = null;
+        try {
+            checkpointThreadIdField.setLong(null, Thread.currentThread().getId());
+            daemonPool = ThreadPoolManager.newDaemonCacheThreadPool(1, daemonPoolName, true);
+            priorityPool = ThreadPoolManager.newDaemonFixedPriorityThreadPool(1, 1, priorityPoolName, true);
+            scheduledPool = ThreadPoolManager.newDaemonScheduledThreadPool(1, scheduledPoolName, true);
+
+            Assertions.assertFalse(poolMap.containsKey(daemonPoolName));
+            Assertions.assertFalse(poolMap.containsKey(priorityPoolName));
+            Assertions.assertFalse(poolMap.containsKey(scheduledPoolName));
+        } finally {
+            checkpointThreadIdField.setLong(null, previousCheckpointThreadId);
+            poolMap.remove(daemonPoolName);
+            poolMap.remove(priorityPoolName);
+            poolMap.remove(scheduledPoolName);
+            if (daemonPool != null) {
+                daemonPool.shutdownNow();
+            }
+            if (priorityPool != null) {
+                priorityPool.shutdownNow();
+            }
+            if (scheduledPool != null) {
+                scheduledPool.shutdownNow();
+            }
+        }
+    }
 
     @Test
     public void testNormal() throws InterruptedException {
@@ -115,6 +166,34 @@ public class ThreadPoolManagerTest {
     }
 
     @Test
+    public void testFixedThreadPoolWithAbortPolicy() {
+        ThreadPoolExecutor executor = ThreadPoolManager.newDaemonFixedThreadPoolWithAbortPolicy(
+                1, 1, "test_abort_policy_pool", false);
+        CountDownLatch occupied = new CountDownLatch(1);
+        try {
+            Assertions.assertEquals(ThreadPoolManager.FastAbortPolicy.class,
+                    executor.getRejectedExecutionHandler().getClass());
+
+            // the single thread takes the first task, the single queue slot takes the second,
+            // and the third has nowhere to go: it must fail the submission rather than wait
+            executor.execute(() -> {
+                try {
+                    occupied.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            executor.execute(() -> {
+            });
+            Assertions.assertThrows(RejectedExecutionException.class, () -> executor.execute(() -> {
+            }));
+        } finally {
+            occupied.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
     public void testSetFixedThreadPoolSize() {
         int expectedPoolSize = 2;
         ThreadPoolExecutor testPool =
@@ -143,5 +222,38 @@ public class ThreadPoolManagerTest {
         // can't set to <= 0
         Assertions.assertThrows(IllegalArgumentException.class, () -> ThreadPoolManager.setFixedThreadPoolSize(testPool, 0));
         Assertions.assertThrows(IllegalArgumentException.class, () -> ThreadPoolManager.setFixedThreadPoolSize(testPool, -1));
+    }
+
+    @Test
+    public void testCacheThreadPoolWithQueueRunsTasksConcurrently() throws InterruptedException {
+        int numThreads = 4;
+        ThreadPoolExecutor executor =
+                ThreadPoolManager.newDaemonCacheThreadPool(numThreads, 16, "test_cache_queue_pool", false);
+        CountDownLatch release = new CountDownLatch(1);
+        try {
+            Assertions.assertEquals(numThreads, executor.getCorePoolSize());
+            Assertions.assertEquals(numThreads, executor.getMaximumPoolSize());
+            Assertions.assertTrue(executor.allowsCoreThreadTimeOut());
+
+            // Tasks block until released, so all of them can only be running at once if the pool
+            // starts a thread per task instead of queueing behind a single worker.
+            CountDownLatch started = new CountDownLatch(numThreads);
+            for (int i = 0; i < numThreads; i++) {
+                executor.execute(() -> {
+                    started.countDown();
+                    try {
+                        release.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+            }
+            Assertions.assertTrue(started.await(10, TimeUnit.SECONDS));
+            Assertions.assertEquals(numThreads, executor.getActiveCount());
+            Assertions.assertEquals(0, executor.getQueue().size());
+        } finally {
+            release.countDown();
+            executor.shutdownNow();
+        }
     }
 }

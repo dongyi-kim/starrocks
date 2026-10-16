@@ -67,8 +67,22 @@ public class MvTaskRunContext extends TaskRunContext {
     private int partitionTTLNumber = TableProperty.INVALID;
     private final MVRefreshRuntimeState refreshRuntimeState = new MVRefreshRuntimeState();
 
+    // Set when auto_refresh_partitions_limit excluded older changed partitions from a complete refresh
+    // this batch: the batch then does not cover the whole MV and must not confirm whole-MV freshness.
+    private boolean partitionLimitExcludedPartitions = false;
+    // MaterializedView#getVersionMapResetEpoch as this run saw it before reading anything, -1 when not recorded.
+    private long versionMapResetEpoch = -1;
+
     public MvTaskRunContext(TaskRunContext context) {
         super(context);
+    }
+
+    public long getVersionMapResetEpoch() {
+        return versionMapResetEpoch;
+    }
+
+    public void setVersionMapResetEpoch(long versionMapResetEpoch) {
+        this.versionMapResetEpoch = versionMapResetEpoch;
     }
 
     public MVRefreshRuntimeState getRefreshRuntimeState() {
@@ -137,6 +151,14 @@ public class MvTaskRunContext extends TaskRunContext {
 
     public void setPartitionTTLNumber(int partitionTTLNumber) {
         this.partitionTTLNumber = partitionTTLNumber;
+    }
+
+    public boolean isPartitionLimitExcludedPartitions() {
+        return partitionLimitExcludedPartitions;
+    }
+
+    public void setPartitionLimitExcludedPartitions(boolean partitionLimitExcludedPartitions) {
+        this.partitionLimitExcludedPartitions = partitionLimitExcludedPartitions;
     }
 
     /**

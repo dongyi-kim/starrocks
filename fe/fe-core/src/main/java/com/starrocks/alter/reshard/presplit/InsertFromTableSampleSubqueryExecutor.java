@@ -15,10 +15,14 @@
 package com.starrocks.alter.reshard.presplit;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.starrocks.catalog.Column;
 import com.starrocks.common.StarRocksException;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
- * Data-tier {@link SampleSubqueryExecutor} for the INSERT-from-OLAP-table path.
+ * Data-tier {@link SampleSubqueryExecutor} for the INSERT-from-table path.
  * Synthesizes a {@code SELECT <sort_key_cols>[, <partition_source_cols>] FROM
  * <source_table> [WHERE (<user_pred>) AND] rand(...) < rate ORDER BY rand(...)
  * LIMIT N} sub-query and decodes the JSON result rows using the TARGET column
@@ -45,20 +49,65 @@ final class InsertFromTableSampleSubqueryExecutor extends AbstractSqlSampleSubqu
 
     @Override
     protected SampleSpec resolveSampleSpec(SampleRequest request) throws StarRocksException {
+        InsertFromTableScanContext context = contextOf(request);
+        return new SampleSpec(
+                context.sourceFromSql(),
+                context.wherePredicateSql(),
+                context.sourceTotalBytes(),
+                context.computeResource(),
+                projections(request.getSortKey(), context),
+                projections(request.getPartitionSourceColumns(), context),
+                request.getSortKey(),
+                request.getPartitionSourceColumns(),
+                context.sourceTotalRows(),
+                context.wherePredicateSql() != null,
+                /*scannedInputBytes*/ context.sourceTotalBytes(),
+                /*partitionSourceBytes*/ List.of(),
+                context.sessionSemantics());
+    }
+
+    /**
+     * Projects each rollup's sort key through the scan context's maps, exactly as
+     * {@link #resolveSampleSpec} projects the base sort key, so a rollup whose sort key reorders or
+     * subsets the base is projected correctly regardless of source column naming.
+     */
+    @Override
+    protected List<String> secondaryProjectionIdents(SampleRequest request) throws StarRocksException {
+        InsertFromTableScanContext context = contextOf(request);
+        List<String> idents = new ArrayList<>();
+        for (SecondaryIndexSpec spec : request.getSecondaryIndexSortKeys()) {
+            idents.addAll(projections(spec.sortKey(), context));
+        }
+        return idents;
+    }
+
+    private static InsertFromTableScanContext contextOf(SampleRequest request) throws StarRocksException {
         ScanContext scanContext = request.getScanContext();
         if (!(scanContext instanceof InsertFromTableScanContext context)) {
             throw new StarRocksException(ERROR_PREFIX + "received a "
                     + scanContext.getClass().getSimpleName()
-                    + " — wire only the INSERT-from-table load kind here");
+                    + " -- wire only the INSERT-from-table load kind here");
         }
-        return new SampleSpec(
-                context.sourceFromSql(),
-                context.wherePredicateSql(),
-                Math.max(0L, context.sourceTable().getDataSize()),
-                context.computeResource(),
-                identsOf(context.sortKeySourceColumnNames()),
-                identsOf(context.partitionSourceColumnNames()),
-                request.getSortKey(),
-                request.getPartitionSourceColumns());
+        return context;
+    }
+
+    /**
+     * Projects target columns (a sort key -- base or rollup -- or the partition columns): each by the
+     * source-table column that backs it, or -- when the SELECT feeds it a literal or computes it, or it
+     * is a generated column -- by that literal or expression cast to the column type
+     * ({@link InsertSelectSourceColumns#projections}). Throws (-&gt; the sample fails -&gt; the load
+     * proceeds without pre-split) if a column is backed by none of them, so a boundary is never
+     * computed against the wrong source column. {@code prepare} gates this at admission time; the
+     * throw remains as the fail-safe for a metadata race between prepare and sampling.
+     */
+    private static List<String> projections(
+            List<Column> targetColumns, InsertFromTableScanContext context) throws StarRocksException {
+        List<String> projections = InsertSelectSourceColumns.projections(targetColumns,
+                context.targetToSourceColumnNames(), context.targetToConstantSql(), context.targetToExpressionSql());
+        if (projections == null) {
+            throw new StarRocksException(ERROR_PREFIX
+                    + "a projected column has no source-table column mapping, literal, or expression");
+        }
+        return projections;
     }
 }

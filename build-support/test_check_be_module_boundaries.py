@@ -37,6 +37,9 @@ SPEC.loader.exec_module(MODULE)
 
 
 class CheckBeModuleBoundariesTest(unittest.TestCase):
+    def test_schema_scanner_is_an_internal_include_prefix(self) -> None:
+        self.assertTrue(MODULE._is_internal_include("schema_scanner/schema_tables_scanner.h"))
+
     def test_load_path_allowlist_ignores_comments_and_blank_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             allowlist_path = Path(tmpdir) / "allowlist.txt"
@@ -46,7 +49,7 @@ class CheckBeModuleBoundariesTest(unittest.TestCase):
                     # comment
 
                     src/exec/exec_env.cpp
-                    src/storage/lake/update_manager.cpp
+                    src/storage/lake/primary_key_manager.cpp
                     """
                 )
             )
@@ -54,7 +57,7 @@ class CheckBeModuleBoundariesTest(unittest.TestCase):
             self.assertEqual(
                 {
                     "src/exec/exec_env.cpp",
-                    "src/storage/lake/update_manager.cpp",
+                    "src/storage/lake/primary_key_manager.cpp",
                 },
                 MODULE.load_path_allowlist(allowlist_path),
             )

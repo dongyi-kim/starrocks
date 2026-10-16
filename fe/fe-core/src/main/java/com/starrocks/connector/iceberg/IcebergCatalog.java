@@ -266,6 +266,10 @@ public interface IcebergCatalog extends MemoryTrackable {
     default void invalidateCache(String dbName, String tableName) {
     }
 
+    /** Releases clients and threads owned by this catalog; called when its connector shuts down. */
+    default void shutdown() {
+    }
+
     default StarRocksIcebergTableScan getTableScan(Table table, StarRocksIcebergTableScanContext srScanContext) {
         return new StarRocksIcebergTableScan(
                 table,
@@ -347,6 +351,11 @@ public interface IcebergCatalog extends MemoryTrackable {
                                     UNPARTITIONED_EQUALITY_DELETE_FILE_COUNT_COLUMN_INDEX,
                                     EMPTY_PARTITION_NAME);
                             partition = new Partition(lastUpdated, version);
+                            partition.setRecordCount(readPartitionLong(row, UNPARTITIONED_RECORD_COUNT_COLUMN_INDEX));
+                            partition.setPositionDeleteRecordCount(
+                                    readPartitionLong(row, UNPARTITIONED_POSITION_DELETE_RECORD_COUNT_COLUMN_INDEX));
+                            partition.setEqualityDeleteRecordCount(
+                                    readPartitionLong(row, UNPARTITIONED_EQUALITY_DELETE_RECORD_COUNT_COLUMN_INDEX));
                             break;
                         }
                     }
@@ -405,6 +414,11 @@ public interface IcebergCatalog extends MemoryTrackable {
                                     PARTITION_EQUALITY_DELETE_FILE_COUNT_COLUMN_INDEX,
                                     partitionName);
                             Partition partition = new Partition(lastUpdated, version, specId);
+                            partition.setRecordCount(readPartitionLong(row, PARTITION_RECORD_COUNT_COLUMN_INDEX));
+                            partition.setPositionDeleteRecordCount(
+                                    readPartitionLong(row, PARTITION_POSITION_DELETE_RECORD_COUNT_COLUMN_INDEX));
+                            partition.setEqualityDeleteRecordCount(
+                                    readPartitionLong(row, PARTITION_EQUALITY_DELETE_RECORD_COUNT_COLUMN_INDEX));
                             partitionMap.put(partitionName, partition);
                         }
                     }
@@ -414,6 +428,20 @@ public interface IcebergCatalog extends MemoryTrackable {
             }
         }
         return partitionMap;
+    }
+
+    // Reads a long column (e.g. record_count, *_delete_record_count) from a PARTITIONS metadata-table row.
+    // Returns -1 (unknown) on any absence/error, so callers degrade gracefully rather than failing.
+    private long readPartitionLong(StructLike row, int columnIndex) {
+        if (row == null) {
+            return -1;
+        }
+        try {
+            Long recordCount = row.get(columnIndex, Long.class);
+            return recordCount == null ? -1 : recordCount;
+        } catch (Exception e) {
+            return -1;
+        }
     }
 
     private long getPartitionLastUpdatedTime(IcebergTable icebergTable, StructLike row,

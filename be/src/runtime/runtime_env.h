@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "common/status.h"
@@ -51,6 +52,15 @@ public:
     ProcessMemoryMetrics* process_memory_metrics() const;
 
     MemTracker* process_mem_tracker() const { return _process_mem_tracker.get(); }
+    std::shared_ptr<MemTracker> process_mem_tracker_shared() const { return _process_mem_tracker; }
+#ifdef BE_TEST
+    // Swaps in |tracker| as the process mem tracker and returns the previous one, so tests can
+    // install an isolated tracker and restore the original afterward.
+    std::shared_ptr<MemTracker> swap_process_mem_tracker_for_test(std::shared_ptr<MemTracker> tracker) {
+        std::swap(_process_mem_tracker, tracker);
+        return tracker;
+    }
+#endif
     MemTracker* query_pool_mem_tracker() const { return _query_pool_mem_tracker.get(); }
     std::shared_ptr<MemTracker> query_pool_mem_tracker_shared() const { return _query_pool_mem_tracker; }
     MemTracker* connector_scan_pool_mem_tracker() const { return _connector_scan_pool_mem_tracker.get(); }
@@ -111,6 +121,7 @@ public:
     ThreadPool* load_rowset_thread_pool() const { return _thread_pools.load_rowset_thread_pool(); }
     ThreadPool* load_segment_thread_pool() const { return _thread_pools.load_segment_thread_pool(); }
     ThreadPool* put_combined_txn_log_thread_pool() const { return _thread_pools.put_combined_txn_log_thread_pool(); }
+    ThreadPool* load_sink_close_thread_pool() const { return _thread_pools.load_sink_close_thread_pool(); }
     PriorityThreadPool* pipeline_prepare_pool() const { return _thread_pools.pipeline_prepare_pool(); }
     PriorityThreadPool* pipeline_sink_io_pool() const { return _thread_pools.pipeline_sink_io_pool(); }
     PriorityThreadPool* query_rpc_pool() const { return _thread_pools.query_rpc_pool(); }

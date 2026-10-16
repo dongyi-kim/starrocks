@@ -93,6 +93,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -121,6 +122,21 @@ public class MaterializedViewHandler extends AlterHandler {
     // keep table's running job,used for concurrency limit
     // table id -> set of running job ids
     private final Map<Long, Set<Long>> tableRunningJobMap = new ConcurrentHashMap<>();
+
+    @Override
+    protected void onStopped() {
+        super.onStopped();
+        // Leader-only concurrency gate, fully repopulated by runAlterJobV2 on the next
+        // leadership. Clearing it also fixes a slot leak: a job that finished and was
+        // expiry-removed by another leader while this node was a follower is removed from
+        // alterJobsV2 by replay but never from this map, permanently consuming a per-table
+        // slot and suspending new rollups on that table.
+        // tableNotFinalStateJobMap is deliberately NOT cleared: replay maintains it, and it
+        // drives the ROLLUP -> NORMAL table-state restore for jobs finished via replay.
+        synchronized (tableRunningJobMap) {
+            tableRunningJobMap.clear();
+        }
+    }
 
     @Override
     public void addAlterJobV2(AlterJobV2 alterJob) {
@@ -250,7 +266,8 @@ public class MaterializedViewHandler extends AlterHandler {
         // A routable range rollup promotes its shadow to NORMAL directly, so it cannot share the
         // multi-job ROLLUP-state batch the existing rollup path uses; reject more than one in one
         // statement before any job is built.
-        if (isRangeRollupRoutable(olapTable)) {
+        boolean rangeRoutable = isRangeRollupRoutable(olapTable);
+        if (rangeRoutable) {
             long rollupClauseCount = alterClauses.stream()
                     .filter(clause -> clause instanceof AddRollupClause)
                     .count();
@@ -282,13 +299,22 @@ public class MaterializedViewHandler extends AlterHandler {
                 // step 2.1 check whether base index already exists in globalStateMgr
                 long baseIndexMetaId = checkAndGetBaseIndex(baseIndexName, olapTable);
 
+                // A range-distribution rollup is always derived from the base index (the K-tablet
+                // sampling and the version-pinned rewrite read the base). ADD ROLLUP ... FROM <rollup>
+                // is not supported. Checked here, before schema validation, so a FROM whose columns
+                // differ from the base reports this precise error rather than "column does not exist".
+                if (rangeRoutable && baseIndexMetaId != olapTable.getBaseIndexMetaId()) {
+                    throw new DdlException("A range-distribution rollup must be derived from the base index; "
+                            + "FROM <rollup> is not supported");
+                }
+
                 // step 2.2  check rollup schema
                 List<Column> rollupSchema =
                         checkAndPrepareMaterializedView(addRollupClause, olapTable, baseIndexMetaId);
 
                 // step 3 create rollup job
                 AlterJobV2 alterJobV2;
-                if (isRangeRollupRoutable(olapTable)) {
+                if (rangeRoutable) {
                     // Shared-data range table: build the additive K-tablet range-rollup job directly.
                     // Any range table that is NOT routable (sync MV, shared-nothing, colocate,
                     // auto-increment, primary-key) keeps the existing rejection in createMaterializedViewJob.
@@ -338,15 +364,16 @@ public class MaterializedViewHandler extends AlterHandler {
      * (The caller is {@code processBatchAddRollup}, so this is always a plain rollup, never a
      * synchronous materialized view, which carries a query statement.)
      */
-    static boolean isRangeRollupRoutable(OlapTable olapTable) {
-        // Only the base index may exist. The additive range-rollup path promotes its shadow to NORMAL
-        // directly (bypassing the multi-job ROLLUP-state coordination the existing path relies on), so a
-        // table that already carries a secondary index/rollup is not routable; it falls through to the
-        // existing range rejection in createMaterializedViewJob.
+    public static boolean isRangeRollupRoutable(OlapTable olapTable) {
+        // A cloud-native, non-colocate, non-auto-increment, non-primary-key range-distribution table
+        // admits an additive rollup. A table that already carries one or more rollups is still routable:
+        // each additive job is serialized by the table's OlapTableState (a new ADD ROLLUP requires the
+        // table to be NORMAL) and operates only on its own shadow index meta id, so a completed rollup
+        // does not interfere. (The caller is processBatchAddRollup, so this is always a plain rollup,
+        // never a synchronous materialized view, which carries a query statement.)
         return olapTable.isRangeDistribution()
                 && olapTable.isCloudNativeTable()
-                && olapTable.getIndexMetaIdToMeta().size() == 1
-                && !GlobalStateMgr.getCurrentState().getColocateTableIndex().isColocateTable(olapTable.getId())
+                && !olapTable.hasColocateGroup()
                 && !olapTable.hasAutoIncrementColumn()
                 && olapTable.getKeysType() != KeysType.PRIMARY_KEYS;
     }
@@ -529,13 +556,17 @@ public class MaterializedViewHandler extends AlterHandler {
             // this method. Everything else on a range table -- a synchronous materialized view (which
             // carries a query statement), a shared-nothing table, a colocate / auto-increment /
             // primary-key table -- is rejected here.
+            if (queryStatement != null) {
+                throw new DdlException(
+                    "Synchronous materialized view is not supported on tables with range distribution. " +
+                    "Use an asynchronous materialized view instead: declare it with an explicit " +
+                    "REFRESH clause (REFRESH ASYNC or REFRESH MANUAL) or a DISTRIBUTED BY clause, " +
+                    "e.g. CREATE MATERIALIZED VIEW ... DISTRIBUTED BY HASH(...) REFRESH ASYNC AS SELECT ...");
+            }
             throw new DdlException(
-                "Synchronous materialized view / rollup is not supported on " +
-                "tables with range distribution. Use an asynchronous " +
-                "materialized view instead: declare it with an explicit " +
-                "REFRESH clause (REFRESH ASYNC or REFRESH MANUAL) or a " +
-                "DISTRIBUTED BY clause, e.g. CREATE MATERIALIZED VIEW ... " +
-                "DISTRIBUTED BY HASH(...) REFRESH ASYNC AS SELECT ...");
+                "ADD ROLLUP is not supported on this table with range distribution. A range distribution " +
+                "rollup is supported only on a shared-data, non-colocate, non-auto-increment, " +
+                "non-primary-key range table.");
         }
         if (mvKeysType == null) {
             // assign rollup index's key type, same as base index's
@@ -1129,7 +1160,7 @@ public class MaterializedViewHandler extends AlterHandler {
 
         if (rollupJobV2.isTimeout()) {
             // in run(), the timeout job will be cancelled.
-            rollupJobV2.run();
+            runAlterJobV2Safely(rollupJobV2);
             return;
         }
 
@@ -1155,7 +1186,7 @@ public class MaterializedViewHandler extends AlterHandler {
         }
 
         if (shouldJobRun) {
-            rollupJobV2.run();
+            runAlterJobV2Safely(rollupJobV2);
         }
     }
 
@@ -1273,14 +1304,16 @@ public class MaterializedViewHandler extends AlterHandler {
                         + "Use 'ALTER TABLE DROP ROLLUP' if you want to.");
             }
 
-            // find from new alter jobs first
-            if (cancelAlterTableStmt.getAlterJobIdList() != null) {
-                for (Long jobId : cancelAlterTableStmt.getAlterJobIdList()) {
+            // find from new alter jobs first; no job ids means all unfinished jobs of the table
+            List<Long> alterJobIdList = cancelAlterTableStmt.getAlterJobIdList();
+            if (alterJobIdList != null && !alterJobIdList.isEmpty()) {
+                // a repeated job id must be cancelled once, or the second attempt is reported as refused
+                for (Long jobId : new LinkedHashSet<>(alterJobIdList)) {
                     AlterJobV2 alterJobV2 = getUnfinishedAlterJobV2ByJobId(jobId);
                     if (alterJobV2 == null) {
                         continue;
                     }
-                    rollupJobV2List.add(getUnfinishedAlterJobV2ByJobId(jobId));
+                    rollupJobV2List.add(alterJobV2);
                 }
             } else {
                 rollupJobV2List = getUnfinishedAlterJobV2ByTableId(olapTable.getId());
@@ -1293,11 +1326,19 @@ public class MaterializedViewHandler extends AlterHandler {
         }
 
         // alter job v2's cancel must be called outside the database lock
+        List<String> notCancelledJobs = new ArrayList<>();
         for (AlterJobV2 alterJobV2 : rollupJobV2List) {
-            alterJobV2.cancel(reason);
+            // e.g. a lake rollup job in FINISHED_REWRITING refuses to be cancelled. A job the scheduler
+            // cancelled meanwhile (e.g. on timeout) also returns false, but it ended as the user asked.
+            if (!alterJobV2.cancel(reason) && alterJobV2.getJobState() != AlterJobV2.JobState.CANCELLED) {
+                notCancelledJobs.add("JobId: " + alterJobV2.getJobId() + ", State: " + alterJobV2.getJobState());
+            }
             if (alterJobV2.isDone()) {
                 onJobDone(alterJobV2);
             }
+        }
+        if (!notCancelledJobs.isEmpty()) {
+            throw new DdlException("Job can not be cancelled. " + String.join("; ", notCancelledJobs));
         }
     }
 

@@ -20,8 +20,8 @@
 #include "platform/key_cache.h"
 #include "storage/chunk_helper.h"
 #include "storage/lake/meta_file.h"
+#include "storage/lake/primary_key_manager.h"
 #include "storage/lake/tablet.h"
-#include "storage/lake/update_manager.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet_meta_manager.h"
 #include "storage_primitive/primary_key_encoder.h"
@@ -34,7 +34,7 @@ Status LakePrimaryKeyRecover::pre_cleanup() {
     _metadata->clear_delvec_meta();
     _metadata->clear_sstable_meta();
     // 2. reset primary index
-    RETURN_ERROR_IF_FALSE(_tablet->update_mgr()->try_remove_primary_index_cache(_tablet->id()));
+    RETURN_ERROR_IF_FALSE(_tablet->primary_key_mgr()->try_remove_primary_index_cache(_tablet->id()));
     DataDir* data_dir = StorageEngine::instance()->get_persistent_index_store(_tablet->id());
     if (data_dir != nullptr) {
         // clear local persistent index's index meta from rocksdb, and index files.
@@ -104,6 +104,16 @@ Status LakePrimaryKeyRecover::rowset_iterator(
             }
             ASSIGN_OR_RETURN(auto read_file, fs::new_random_access_file(ropts, _tablet->tablet_mgr()->del_location(
                                                                                        _metadata->id(), del.name())));
+            // Recovery rebuilds every delvec from these deletes, so a corrupt del file that still
+            // deserializes would bake the wrong rows into the recovered delvecs -- permanently, since
+            // recovery treats the result as the new source of truth. The shared PrimaryKeyRecover
+            // consumes plain file handles (it also serves shared-nothing, which has no del checksum),
+            // so verify here before handing the handle over; it re-reads positionally from offset 0.
+            // Only pays the extra read when a checksum was actually recorded.
+            if (del.has_crc32c()) {
+                auto verified = read_and_verify_del_file(read_file.get(), del, _metadata->id());
+                RETURN_IF_ERROR(verified.status());
+            }
             del_rfs.push_back(std::move(read_file));
         }
         // Position of each del file in the merged (segments + dels) replay sequence consumed by the

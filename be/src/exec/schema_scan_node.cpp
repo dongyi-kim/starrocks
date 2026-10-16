@@ -20,7 +20,8 @@
 #include "common/runtime_profile.h"
 #include "exec/pipeline/scan/schema_scan_context.h"
 #include "exec/pipeline/scan/schema_scan_operator.h"
-#include "exec/schema_scanner/schema_helper.h"
+#include "exec/schema_scanner_factory.h"
+#include "exec/schema_scanner_factory_adapter.h"
 #include "exprs/chunk_predicate_evaluator.h"
 #include "runtime/descriptors_ext.h"
 #include "runtime/runtime_state.h"
@@ -80,8 +81,10 @@ Status SchemaScanNode::init(const TPlanNode& tnode, RuntimeState* state) {
         _scanner_param.thread_id = tnode.schema_scan_node.thread_id;
     }
 
-    // only for no predicate and limit parameter is set
-    if (tnode.conjuncts.empty() && tnode.limit > 0) {
+    // No predicate + limit only, and only for the internal catalog: the nameless describe reads the local metastore.
+    const bool internal_catalog =
+            !tnode.schema_scan_node.__isset.catalog_name || tnode.schema_scan_node.catalog_name == "default_catalog";
+    if (internal_catalog && tnode.conjuncts.empty() && tnode.limit > 0) {
         _scanner_param.without_db_table = true;
         _scanner_param.limit = tnode.limit;
     }
@@ -116,12 +119,8 @@ Status SchemaScanNode::prepare(RuntimeState* state) {
     _scanner_param._fill_chunk_timer = ADD_TIMER(_runtime_profile, "FillChunk");
     _filter_timer = ADD_TIMER(_runtime_profile, "FilterTime");
 
-    // new one scanner
-    _schema_scanner = SchemaScanner::create(schema_table->schema_table_type());
-
-    if (nullptr == _schema_scanner) {
-        return Status::InternalError("schema scanner get nullptr pointer.");
-    }
+    ASSIGN_OR_RETURN(_schema_scanner, create_schema_scanner(resolve_schema_scanner_factory(state->exec_env()),
+                                                            schema_table->schema_table_type()));
 
     RETURN_IF_ERROR(_schema_scanner->init(&_scanner_param, _pool));
 

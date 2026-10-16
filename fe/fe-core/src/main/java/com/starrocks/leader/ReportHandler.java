@@ -389,7 +389,7 @@ public class ReportHandler extends LeaderDaemon implements MemoryTrackable {
     }
 
     private void putToQueue(ReportTask reportTask) throws Exception {
-        if (isStopped()) {
+        if (isStopRequested()) {
             // Demotion is in progress: reject so the caller can translate this into a NOT_MASTER
             // response (see LeaderImpl#report). Silently dropping would ACK the request as OK and
             // the BE would never retry against the new leader, losing the report update.
@@ -1387,6 +1387,7 @@ public class ReportHandler extends LeaderDaemon implements MemoryTrackable {
                                     MaterializedIndexMeta indexMeta = olapTable.getIndexMetaByMetaId(index.getMetaId());
                                     Set<ColumnId> bfColumns = olapTable.getBfColumnIds();
                                     double bfFpp = olapTable.getBfFpp();
+                                    Set<ColumnId> zstdCompressionColumns = olapTable.getZstdCompressionColumnIds();
                                     TTabletSchema tabletSchema = SchemaInfo.newBuilder()
                                             .setId(indexMeta.getSchemaId())
                                             .setKeysType(indexMeta.getKeysType())
@@ -1397,6 +1398,8 @@ public class ReportHandler extends LeaderDaemon implements MemoryTrackable {
                                             .addColumns(indexMeta.getSchema())
                                             .setBloomFilterColumnNames(bfColumns)
                                             .setBloomFilterFpp(bfFpp)
+                                            .setZstdCompressionColumns(zstdCompressionColumns,
+                                                    olapTable.getZstdCompressionPageSizes())
                                             .setIndexes(index.getMetaId() == olapTable.getBaseIndexMetaId() ?
                                                         olapTable.getCopiedIndexes() :
                                                         OlapTable.getIndexesBySchema(
@@ -2113,7 +2116,8 @@ public class ReportHandler extends LeaderDaemon implements MemoryTrackable {
                     for (Column column : indexMeta.getSchema()) {
                         TColumn tColumn = column.toThrift();
                         tColumn.setColumn_name(column.getColumnId().getId());
-                        column.setIndexFlag(tColumn, olapTable.getIndexes(), olapTable.getBfColumnIds());
+                        column.setIndexFlag(tColumn, olapTable.getIndexes(), olapTable.getBfColumnIds(),
+                                olapTable.getZstdCompressionColumnIds(), olapTable.getZstdCompressionPageSizes());
                         columnsDesc.add(tColumn);
                     }
                     if (indexMeta.getSortKeyUniqueIds() != null) {
@@ -2482,9 +2486,9 @@ public class ReportHandler extends LeaderDaemon implements MemoryTrackable {
             }
             TABLET_TO_DROP_TIME.clear();
         }
-        // Stop the nested resource-report consumer as part of this handler's own shutdown,
-        // so both loops drain synchronously during leader demotion.
-        resourceReportDaemon.stopGracefully(Math.max(1000L, Config.leader_demotion_drain_timeout_sec * 1000L));
+        // Stop the nested resource-report consumer as part of this handler's own shutdown. Fire-and-
+        // forget: its worker self-cleans in onStopped() and deregisters; the re-activation gate covers it.
+        resourceReportDaemon.stopBestEffort();
     }
 
     /**

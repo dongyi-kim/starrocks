@@ -63,7 +63,7 @@ partition_name: p06
 
 StarRocks 采用等深直方图 (Equi-height Histogram)，即选定若干个 bucket，每个 bucket 中的数据量几乎相等。对于出现频次较高、对选择率（selectivity）影响较大的数值，StarRocks 会分配单独的桶进行存储。桶数量越多时，直方图的估算精度就越高，但是也会增加统计信息的内存使用。您可以根据业务情况调整直方图的桶个数和单个采集任务的 MCV（most common value）个数。
 
-**直方图适用于有明显数据倾斜，并且有频繁查询请求的列。如果您的表数据分布比较均匀，可以不使用直方图。直方图支持的列类型为数值类型、DATE、DATETIME 或字符串类型。**
+**直方图适用于有明显数据倾斜，并且有频繁查询请求的列。如果您的表数据分布比较均匀，可以不使用直方图。直方图支持的列类型为数值类型、DATE、DATETIME 或字符串类型。对于字符串类型，StarRocks 仅收集 MCV（most common value），不收集直方图桶。**
 
 直方图统计信息存储在 StarRocks 集群 `_statistics_` 数据库的 `histogram_statistics` 表中。查询时会返回类似如下信息：
 
@@ -244,7 +244,7 @@ ANALYZE [FULL|SAMPLE] TABLE tbl_name
 - 采集列类型：
   - `col_name`: 要采集统计信息的列，多列使用逗号分隔。如果不指定，表示采集整张表的信息。
   - `ALL COLUMNS`：对所有列进行采集。自 v3.5.0 起支持。
-  - `PREDICATE COLUMNS`：仅对 Predicate Column 进行采集。自 v3.5.0 起支持。
+  - `PREDICATE COLUMNS`：仅对 Predicate Column 进行采集。原生表自 v3.5.0 起支持，可分析的外部表（包括 Hive、Iceberg、Hudi、ODPS、Delta Lake 和 Paimon）自 v4.1.4 起支持。
   - `MULTIPLE COLUMNS`：对指定的多个列进行联合统计信息进行采集。当前多列联合统计信息仅支持手动同步采集。当前手动采集多列联合统计信息的列数不能超过 `statistics_max_multi_column_combined_num`, 默认值为 `10`。自 v3.5.0 起支持。
 
 - `PROPERTIES`: 采集任务的自定义参数。如果不配置，则采用 `fe.conf` 中的默认配置。

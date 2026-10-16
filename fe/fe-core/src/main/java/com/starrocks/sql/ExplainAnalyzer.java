@@ -1103,6 +1103,8 @@ public class ExplainAnalyzer {
         appendMetric(uniqueMetrics, nodeInfo, "TabletCount");
         appendMetric(uniqueMetrics, nodeInfo, "SegmentsReadCount");
         appendMetric(uniqueMetrics, nodeInfo, "RowsetsReadCount");
+        appendMetric(uniqueMetrics, nodeInfo, "PhySegmentsCount");
+        appendMetric(uniqueMetrics, nodeInfo, "PhyRowsetsCount");
         appendMetric(uniqueMetrics, nodeInfo, "TotalColumnsDataPageCount");
         appendMetric(uniqueMetrics, nodeInfo, "ColumnIteratorInit");
         appendMetric(uniqueMetrics, nodeInfo, "BitmapIndexIteratorInit");
@@ -1128,6 +1130,25 @@ public class ExplainAnalyzer {
         appendMetric(uniqueMetrics, nodeInfo, "PeakChunkBufferSize");
         appendMetric(uniqueMetrics, nodeInfo, "ChunkBufferCapacity");
         appendMetric(uniqueMetrics, nodeInfo, "DefaultChunkBufferCapacity");
+        popIndent();
+
+        appendDetailLine("VectorIndex:");
+        pushIndent(GraphElement.LEAF_METRIC_INDENT);
+        appendMetric(uniqueMetrics, nodeInfo, "VectorIndex");
+        appendMetric(uniqueMetrics, nodeInfo, "VectorIndexLoad");
+        appendMetric(uniqueMetrics, nodeInfo, "VectorIndexCacheLookup");
+        appendMetric(uniqueMetrics, nodeInfo, "VectorIndexCacheHit");
+        appendMetric(uniqueMetrics, nodeInfo, "VectorIndexCacheMiss");
+        appendMetric(uniqueMetrics, nodeInfo, "VectorIndexFileOpenAndGetSize");
+        appendMetric(uniqueMetrics, nodeInfo, "VectorIndexFileRead");
+        appendMetric(uniqueMetrics, nodeInfo, "VectorIndexDeserialize");
+        appendMetric(uniqueMetrics, nodeInfo, "VectorIndexSearcherCreate");
+        appendMetric(uniqueMetrics, nodeInfo, "VectorIndexSearch");
+        appendMetric(uniqueMetrics, nodeInfo, "VectorANNSearch");
+        appendMetric(uniqueMetrics, nodeInfo, "VectorResultProcess");
+        // Legacy names kept visible for profiles produced during rolling upgrades.
+        appendMetric(uniqueMetrics, nodeInfo, "ProcessVectorDistanceAndIdTime");
+        appendMetric(uniqueMetrics, nodeInfo, "VectorSearchTime");
         popIndent();
 
         appendGroupedMetricsOthers(uniqueMetrics, nodeInfo, getScanKnownMetrics());
@@ -1754,13 +1775,17 @@ public class ExplainAnalyzer {
                 "RawRowsRead", "RowsRead", "DictDecode", "DictDecodeCount", "ChunkCopy",
                 "IOTime", "BytesRead", "CompressedBytesRead", "UncompressedBytesRead", "ReadPagesNum",
                 "CachedPagesNum", "BlockFetch", "BlockFetchCount", "BlockSeek", "BlockSeekCount", "DecompressTime",
-                "TabletCount", "SegmentsReadCount", "RowsetsReadCount", "TotalColumnsDataPageCount",
+                "TabletCount", "SegmentsReadCount", "RowsetsReadCount", "PhySegmentsCount", "PhyRowsetsCount",
+                "TotalColumnsDataPageCount",
                 "ColumnIteratorInit", "BitmapIndexIteratorInit", "FlatJsonInit", "FlatJsonMerge",
                 "IOTaskExecTime", "IOTaskWaitTime", "SubmitTaskCount", "SubmitTaskTime", "PrepareChunkSourceTime",
                 "MorselsCount", "PeakIOTasks", "PeakScanTaskQueueSize", "PeakChunkBufferMemoryUsage",
                 "PeakChunkBufferSize", "ChunkBufferCapacity", "DefaultChunkBufferCapacity",
                 "CreateSegmentIter", "GetDelVec", "GetDeltaColumnGroup", "GetRowsets", "ReadPKIndex",
-                "ProcessVectorDistanceAndIdTime", "VectorSearchTime",
+                "VectorIndex", "VectorIndexLoad", "VectorIndexCacheLookup", "VectorIndexFileOpenAndGetSize",
+                "VectorIndexFileRead", "VectorIndexDeserialize", "VectorIndexSearcherCreate",
+                "VectorIndexCacheHit", "VectorIndexCacheMiss", "VectorIndexSearch", "VectorANNSearch",
+                "VectorResultProcess", "ProcessVectorDistanceAndIdTime", "VectorSearchTime",
                 "PushdownAccessPaths", "PushdownPredicates"
         );
     }

@@ -19,9 +19,9 @@ ADD_BE_LIB(ColumnCore
         array_view_column.cpp
         map_column.cpp
         struct_column.cpp
+        file_column.cpp
         raw_buffer.cpp
         column.cpp
-        column_filter_range.cpp
         column_visitor.cpp
         column_visitor_mutable.cpp
         type_converter.cpp
@@ -66,6 +66,7 @@ ADD_BE_LIB(ColumnCore
         column_hash/column_hash.cpp
         adaptive_offsets.cpp
         serde/column_array_serde.cpp
+        geo_column.cpp
 )
 
 target_link_libraries(ColumnCore PRIVATE arrow streamvbyte)
@@ -80,7 +81,6 @@ ADD_BE_LIB(ChunkCore
         chunk_slice.cpp
         column_access_path.cpp
         datum_tuple.cpp
-        segmented_chunk.cpp
 )
 
 target_link_libraries(ChunkCore PUBLIC ColumnCore)

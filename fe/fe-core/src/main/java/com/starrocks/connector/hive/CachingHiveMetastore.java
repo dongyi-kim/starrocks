@@ -270,6 +270,11 @@ public class CachingHiveMetastore extends CachingMetastore implements IHiveMetas
         return Maps.newHashMap(partitionCache.asMap());
     }
 
+    /** The partitions of this table that this level has cached, without loading any. */
+    public Map<HivePartitionName, Partition> getCachedPartitionsOfTable(String dbName, String tableName) {
+        return partitionCache.getAllPresent(getPresentPartitionNames(partitionCache, dbName, tableName));
+    }
+
     public List<String> loadAllTableNames(String dbName) {
         return metastore.getAllTableNames(dbName);
     }
@@ -527,7 +532,7 @@ public class CachingHiveMetastore extends CachingMetastore implements IHiveMetas
                 if (cause instanceof InvocationTargetException &&
                         ((InvocationTargetException) cause).getTargetException() instanceof NoSuchObjectException) {
                     invalidateTable(hiveDbName, hiveViewName);
-                    throw new StarRocksConnectorException(e.getMessage() + ", invalidated cache.");
+                    throw new StarRocksConnectorException(e.getMessage() + ", invalidated cache.", e);
                 } else {
                     throw e;
                 }
@@ -550,7 +555,7 @@ public class CachingHiveMetastore extends CachingMetastore implements IHiveMetas
             if (cause instanceof InvocationTargetException &&
                     ((InvocationTargetException) cause).getTargetException() instanceof NoSuchObjectException) {
                 invalidateTable(hiveDbName, hiveTblName);
-                throw new StarRocksConnectorException(e.getMessage() + ", invalidated cache.");
+                throw new StarRocksConnectorException(e.getMessage() + ", invalidated cache.", e);
             } else {
                 throw e;
             }

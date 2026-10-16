@@ -17,6 +17,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "column/vectorized_fwd.h"
@@ -94,13 +95,16 @@ public:
     // `target_size` controls the maximum amount of data merged per operation,
     // while `memory_usage_per_merge` controls the peak memory usage of each merge.
     Status merge_write(size_t target_size, size_t memory_usage_per_merge, bool do_sort, bool do_agg,
-                       std::function<Status(Chunk*)> write_func, std::function<Status()> flush_func);
+                       std::function<Status(Chunk*)> write_func, std::function<Status()> flush_func,
+                       bool need_rssid_rowids = false);
 
     StatusOr<SpillBlockInputTasks> generate_spill_block_input_tasks(size_t target_size, size_t memory_usage_per_merge,
-                                                                    bool do_sort, bool do_agg);
+                                                                    bool do_sort, bool do_agg,
+                                                                    bool need_rssid_rowids = false);
 
     StatusOr<LoadSpillMergeInputBatch> generate_merge_input_batch(size_t target_size, size_t memory_usage_per_merge,
-                                                                  bool do_sort, bool do_agg, bool final_round);
+                                                                  bool do_sort, bool do_agg, bool final_round,
+                                                                  bool need_rssid_rowids = false);
 
     bool empty();
 
@@ -130,6 +134,18 @@ private:
     std::unique_ptr<RuntimeProfile> _dummy_profile;
     spill::SpillerFactoryPtr _spiller_factory;
     std::shared_ptr<spill::Spiller> _spiller;
+    // Drives the one-time initialization of `_spiller` (and its serde) in _prepare().
+    // The load spill path is entered concurrently by multiple memtable-flush threads that
+    // share the same LoadChunkSpiller, so std::call_once serializes the first spill: the
+    // winning thread runs the init body while the others block until it finishes and then
+    // observe the fully-constructed `_spiller`. Readiness is no longer inferred from
+    // `_spiller != nullptr`, which used to become visible before the serde's encode context
+    // was created and let a racing thread crash in ColumnarSerde::serialize().
+    std::once_flag _prepare_once;
+    // Result of the one-time initialization, published by the call_once body and read by
+    // every caller. A failed init is cached here (call_once will not re-run on a normal
+    // return), so all threads see the same error instead of using a half-built spiller.
+    Status _prepare_status;
     SchemaPtr _schema;
 };
 

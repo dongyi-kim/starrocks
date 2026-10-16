@@ -45,6 +45,7 @@ import com.starrocks.sql.optimizer.base.RangeDistributionSpec;
 import com.starrocks.sql.optimizer.base.SortProperty;
 import com.starrocks.sql.optimizer.operator.Operator;
 import com.starrocks.sql.optimizer.operator.Projection;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalAIProjectOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalAssertOneRowOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalCTEAnchorOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalCTEConsumeOperator;
@@ -420,8 +421,7 @@ public class OutputPropertyDeriver extends PropertyDeriverBase<PhysicalPropertyS
                 return updateEquivalentDescriptor(node, outputProperty,
                         leftOnPredicateColumns, rightOnPredicateColumns);
 
-            } else if ((leftDistributionDesc.isShuffle() || leftDistributionDesc.isShuffleEnforce()) &&
-                    (rightDistributionDesc.isShuffle()) || rightDistributionDesc.isShuffleEnforce()) {
+            } else if (leftDistributionDesc.isShuffleLike() && rightDistributionDesc.isShuffleLike()) {
                 // shuffle join
                 PhysicalPropertySet outputProperty = computeShuffleJoinOutputProperty(node.getJoinType(),
                         leftDistributionDesc.getDistributionCols(), rightDistributionDesc.getDistributionCols());
@@ -497,6 +497,12 @@ public class OutputPropertyDeriver extends PropertyDeriverBase<PhysicalPropertyS
 
     @Override
     public PhysicalPropertySet visitPhysicalProject(PhysicalProjectOperator node, ExpressionContext context) {
+        checkState(this.childrenOutputProperties.size() == 1);
+        return childrenOutputProperties.get(0);
+    }
+
+    @Override
+    public PhysicalPropertySet visitPhysicalAIProject(PhysicalAIProjectOperator node, ExpressionContext context) {
         checkState(this.childrenOutputProperties.size() == 1);
         return childrenOutputProperties.get(0);
     }

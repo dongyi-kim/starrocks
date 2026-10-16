@@ -32,6 +32,7 @@
 #include "common/object_pool.h"
 #include "common/system/backend_options.h"
 #include "common/util/thrift_util.h"
+#include "compute_env/query/query_runtime_state.h"
 #include "exec/exec_env.h"
 #include "gen_cpp/Exprs_types.h"
 #include "gen_cpp/InternalService_types.h"
@@ -46,6 +47,25 @@ namespace starrocks::orchestration {
 
 QueryOrchestrator::QueryOrchestrator(ExecEnv* exec_env) : _exec_env(exec_env) {
     DCHECK(_exec_env != nullptr);
+}
+
+TQueryOptions QueryOrchestrator::build_external_query_options(const TScanOpenParams& params) {
+    TQueryOptions query_options;
+    query_options.batch_size = params.batch_size;
+    query_options.query_timeout = params.query_timeout;
+    // All scanners of one external query share the same query_id while each open_scanner request
+    // declares a single-instance fragment, so the QueryContext never satisfies is_dead() and always
+    // waits in the second-chance map after all its delivered fragments finish. Without an explicit
+    // query_delivery_timeout that wait falls back to query_timeout (3600s by default in the
+    // Spark/Flink connectors), which keeps the finished query's mem tracker lingering in query_pool
+    // for up to an hour. Bound the tail with the regular delivery-timeout default instead.
+    query_options.__set_query_delivery_timeout(pipeline::QueryRuntimeState::DEFAULT_EXPIRE_SECONDS);
+    query_options.mem_limit = params.mem_limit;
+    query_options.query_type = TQueryType::EXTERNAL;
+    // For spark sql / flink sql, we dont use page cache.
+    query_options.use_page_cache = false;
+    query_options.enable_profile = config::enable_profile_for_external_plan;
+    return query_options;
 }
 
 /*
@@ -72,7 +92,7 @@ Status QueryOrchestrator::exec_external_plan_fragment(const TScanOpenParams& par
     if (!base64_decode(opaqued_query_plan, &query_plan_info)) {
         LOG(WARNING) << "open context error: base64_decode decode opaqued_query_plan failure";
         std::stringstream msg;
-        msg << "query_plan_info: " << query_plan_info
+        msg << "query_plan_info (" << query_plan_info.size() << " bytes)"
             << " validate error, should not be modified after returned StarRocks FE processed";
         return Status::InvalidArgument(msg.str());
     }
@@ -84,13 +104,12 @@ Status QueryOrchestrator::exec_external_plan_fragment(const TScanOpenParams& par
     if (!st.ok()) {
         LOG(WARNING) << "open context error: deserialize TQueryPlanInfo failure";
         std::stringstream msg;
-        msg << "query_plan_info: " << query_plan_info
+        msg << "query_plan_info (" << query_plan_info.size() << " bytes)"
             << " deserialize error, should not be modified after returned StarRocks FE processed";
         return Status::InvalidArgument(msg.str());
     }
 
-    VLOG_ROW << "BackendService execute open() TQueryPlanInfo: "
-             << apache::thrift::ThriftDebugString(t_query_plan_info);
+    VLOG_ROW << "BackendService execute open() TQueryPlanInfo: " << thrift_plan_debug_string(t_query_plan_info);
 
     *query_id = t_query_plan_info.query_id;
 
@@ -101,7 +120,7 @@ Status QueryOrchestrator::exec_external_plan_fragment(const TScanOpenParams& par
     if (!st.ok()) {
         LOG(WARNING) << "open context error: extract DescriptorTbl failure";
         std::stringstream msg;
-        msg << "query_plan_info: " << query_plan_info
+        msg << "query_plan_info (" << query_plan_info.size() << " bytes)"
             << " create DescriptorTbl error, should not be modified after returned StarRocks FE "
                "processed";
         return Status::InvalidArgument(msg.str());
@@ -186,17 +205,8 @@ Status QueryOrchestrator::exec_external_plan_fragment(const TScanOpenParams& par
     fragment_exec_params.__set_instances_number(1);
     exec_fragment_params.__set_params(fragment_exec_params);
     // batch_size for one RowBatch
-    TQueryOptions query_options;
-    query_options.batch_size = params.batch_size;
-    query_options.query_timeout = params.query_timeout;
-    query_options.mem_limit = params.mem_limit;
-    query_options.query_type = TQueryType::EXTERNAL;
-    // For spark sql / flink sql, we dont use page cache.
-    query_options.use_page_cache = false;
-    query_options.enable_profile = config::enable_profile_for_external_plan;
-    exec_fragment_params.__set_query_options(query_options);
-    VLOG_ROW << "external exec_plan_fragment params is "
-             << apache::thrift::ThriftDebugString(exec_fragment_params).c_str();
+    exec_fragment_params.__set_query_options(build_external_query_options(params));
+    VLOG_ROW << "external exec_plan_fragment params is " << thrift_plan_debug_string(exec_fragment_params);
     FragmentExecutor fragment_executor;
     auto status = fragment_executor.prepare(_exec_env, exec_fragment_params, exec_fragment_params);
     if (status.ok()) {

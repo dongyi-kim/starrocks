@@ -67,8 +67,12 @@ import com.starrocks.type.ArrayType;
 import com.starrocks.type.BooleanType;
 import com.starrocks.type.DateType;
 import com.starrocks.type.FloatType;
+import com.starrocks.type.GeoTypeDescriptor;
 import com.starrocks.type.IntegerType;
+import com.starrocks.type.MapType;
 import com.starrocks.type.NullType;
+import com.starrocks.type.PrimitiveType;
+import com.starrocks.type.ScalarType;
 import com.starrocks.type.StringType;
 import com.starrocks.type.StructField;
 import com.starrocks.type.StructType;
@@ -169,10 +173,42 @@ public class FunctionAnalyzer {
                         functionCallExpr.getPos());
             }
 
-            if (!functionCallExpr.getChild(2).isConstant()) {
+            // gram_num is read on the BE as a raw non-nullable INT constant column, with no type or
+            // null check. It is read twice: by ngram_search itself, and -- more dangerously -- by
+            // VectorizedFunctionCallExpr::split_normal_string_to_ngram() while evaluating an NGRAMBF
+            // index in the storage layer, which is reached before ordinary expression evaluation.
+            // "constant" alone is not enough there: a constant of another type (e.g. a JSON
+            // expression) or a constant NULL is a ConstColumn over something that is not an
+            // Int32Column, and reading it crashes the BE. Require a positive integer constant.
+            Expr gramNumExpr = functionCallExpr.getChild(2);
+            Optional<Long> gramNum = extractIntegerValue(gramNumExpr);
+            if (!gramNum.isPresent() || gramNum.get() <= 0 || gramNum.get() > Integer.MAX_VALUE) {
                 throw new SemanticException(
-                        fnName + " function 's third parameter must be constant",
-                        functionCallExpr.getPos());
+                        fnName + " function 's third parameter must be a constant positive integer",
+                        gramNumExpr.getPos());
+            }
+        }
+
+        // tokenize(tokenizer_name, content): the tokenizer name is read on the BE at prepare time as
+        // a raw non-nullable VARCHAR constant column, with no type or null check. A constant of
+        // another type -- e.g. cast('english' as time), which the FE cannot fold and so cannot see
+        // is NULL -- reaches the BE as a constant of the wrong shape and crashes it. Require a
+        // string literal naming one of the tokenizers the BE implements. A NULL constant stays
+        // legal: FoldConstantsRule rewrites the whole call to NULL, so it never reaches the BE.
+        if (fnName.equals(FunctionSet.TOKENIZE) && functionCallExpr.hasChild(0)) {
+            Expr tokenizerExpr = functionCallExpr.getChild(0);
+            Expr unwrapped = unwrapConstantString(tokenizerExpr);
+            if (unwrapped instanceof StringLiteral) {
+                String tokenizer = ((StringLiteral) unwrapped).getValue();
+                if (!FunctionSet.SUPPORTED_TOKENIZERS.contains(tokenizer)) {
+                    throw new SemanticException(
+                            "Unknown tokenizer '" + tokenizer + "'. Supported tokenizers are: " +
+                                    String.join(", ", FunctionSet.SUPPORTED_TOKENIZERS), tokenizerExpr.getPos());
+                }
+            } else if (!(unwrapped instanceof NullLiteral)) {
+                throw new SemanticException(
+                        "tokenize function 's first parameter (tokenizer_name) must be a constant string, one of: " +
+                                String.join(", ", FunctionSet.SUPPORTED_TOKENIZERS), tokenizerExpr.getPos());
             }
         }
         Function fn = functionCallExpr.getFn();
@@ -252,6 +288,10 @@ public class FunctionAnalyzer {
                     new FunctionCallExpr(argFuncNameWithoutIf, functionParamsWithOutIf);
             analyzeBuiltinAggFunction(argFuncNameWithoutIf, functionParamsWithOutIf, functionCallWithoutIf);
         }
+
+        if (fn != null && fn.isAi()) {
+            AIFunctionAnalyzer.analyze(functionCallExpr);
+        }
     }
 
     private static void analyzeBuiltinAggFunction(FunctionCallExpr functionCallExpr) {
@@ -266,6 +306,24 @@ public class FunctionAnalyzer {
         if (fnParams.isStar() && !fnName.equals(FunctionSet.COUNT)) {
             throw new SemanticException("'*' can only be used in conjunction with COUNT: " + ExprToSql.toSql(functionCallExpr),
                     functionCallExpr.getPos());
+        }
+
+        // DISTINCT aggregation over a PERCENTILE value has no meaning and no rewrite: unlike
+        // count(distinct bitmap) / count(distinct hll) -- which the optimizer rewrites to
+        // bitmap_union_count / hll cardinality -- a PERCENTILE cannot be de-duplicated, so the
+        // call reaches the BE as a raw distinct aggregate. There it is dispatched to the
+        // string/binary distinct path and down_casts the PercentileColumn to a BinaryColumn it is
+        // not, which aborts a debug build (casts.h down_cast on BinaryColumnBase) and dereferences
+        // garbage in a release build (SIGSEGV). Reject it at analysis time instead.
+        if (fnParams.isDistinct()) {
+            for (Expr child : functionCallExpr.getChildren()) {
+                if (child.getType().isPercentile()) {
+                    throw new SemanticException(
+                            "DISTINCT aggregation is not supported for PERCENTILE type: " +
+                                    ExprToSql.toSql(functionCallExpr),
+                            functionCallExpr.getPos());
+                }
+            }
         }
 
         if (fnName.equals(FunctionSet.COUNT)) {
@@ -690,7 +748,7 @@ public class FunctionAnalyzer {
                 throw new SemanticException(fnName + " function should have two args", functionCallExpr.getPos());
             }
             if (functionCallExpr.getChild(0).isConstant() || functionCallExpr.getChild(1).isConstant()) {
-                throw new SemanticException(fnName + " function 's args must be constant");
+                throw new SemanticException(fnName + " function 's args must not be constant");
             }
         }
 
@@ -738,6 +796,25 @@ public class FunctionAnalyzer {
         }
 
         return Optional.empty();
+    }
+
+    /**
+     * Peel user variables and casts to a string type off an expression, so that a constant string
+     * argument can be recognised through e.g. cast('english' as varchar). A cast to a non-string
+     * type is deliberately not peeled: cast('english' as time) is not a constant string, even
+     * though the FE will later wrap it in an implicit cast back to VARCHAR -- its value is whatever
+     * the inner cast produces, which the FE cannot fold and which is NULL at runtime.
+     */
+    private static Expr unwrapConstantString(Expr expr) {
+        if (expr instanceof UserVariableExpr) {
+            return unwrapConstantString(((UserVariableExpr) expr).getValue());
+        }
+
+        if (expr instanceof CastExpr && expr.getType().isStringType()) {
+            return unwrapConstantString(expr.getChild(0));
+        }
+
+        return expr;
     }
 
     /**
@@ -892,6 +969,8 @@ public class FunctionAnalyzer {
         } catch (Exception e) {
             throw new SemanticException("Failed to parse view definition: " + fn.getSql());
         }
+        AIFunctionUsageAnalyzer.verifyNoAIFunctions(
+                expr, AIFunctionUsageAnalyzer.PlacementContext.SQL_UDF_BODY);
         SqlFunction v = (SqlFunction) fn.copy();
         v.setAnalyzeExpr(expr);
         v.setRetType(expr.getType());
@@ -964,8 +1043,14 @@ public class FunctionAnalyzer {
                                                         List<Type> newArgumentTypes) {
         Function fn = null;
         String fnName = node.getFunctionName();
-        // throw exception direct
-        if (fnName.equalsIgnoreCase("typeof") && argumentTypes.length == 1) {
+        if (FunctionSet.AI_COMPLETE.equalsIgnoreCase(fnName) && argumentTypes.length == 3
+                && argumentTypes[2].isNull() && !argumentTypes[0].isFileType() && !argumentTypes[1].isFileType()) {
+            // Preserve the legacy options role of an ambiguous third NULL: concrete FILE overloads otherwise
+            // precede polymorphic ANY_MAP overloads. Typed FILE arguments, including typed NULLs, are unchanged.
+            Type[] lookupTypes = argumentTypes.clone();
+            lookupTypes[2] = new MapType(NullType.NULL, NullType.NULL);
+            fn = ExprUtils.getBuiltinFunction(fnName, lookupTypes, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+        } else if (fnName.equalsIgnoreCase("typeof") && argumentTypes.length == 1) {
             // For the typeof function, the parameter type of the function is the result of this function.
             // At this time, the parameter type has been obtained. You can directly replace the current
             // function with StringLiteral. However, since the parent node of the current node in ast
@@ -978,6 +1063,135 @@ public class FunctionAnalyzer {
             Expr newChildExpr = new StringLiteral(originType.toTypeString());
             node.getParams().exprs().set(0, newChildExpr);
             node.setChild(0, newChildExpr);
+        } else if (FunctionSet.ST_COVERAGE_SIMPLIFY.equalsIgnoreCase(fnName)) {
+            if (argumentTypes.length != 2 && argumentTypes.length != 3) {
+                throw new SemanticException("ST_CoverageSimplify requires two or three arguments");
+            }
+            if (argumentTypes[0].getPrimitiveType() != PrimitiveType.GEOMETRY ||
+                    ((ScalarType) argumentTypes[0]).getGeoDescriptor() == null) {
+                throw new SemanticException("ST_CoverageSimplify requires a native GEOMETRY CRS descriptor");
+            }
+            if (!argumentTypes[1].isNumericType() && !argumentTypes[1].isNull()) {
+                throw new SemanticException("ST_CoverageSimplify tolerance must be numeric");
+            }
+            if (argumentTypes.length == 3 && !argumentTypes[2].isBoolean() && !argumentTypes[2].isNull()) {
+                throw new SemanticException("ST_CoverageSimplify boundary must be BOOLEAN");
+            }
+            Expr[] folded = new Expr[argumentTypes.length];
+            for (int i = 1; i < argumentTypes.length; ++i) {
+                if (!node.getChild(i).isConstant()) {
+                    throw new SemanticException("ST_CoverageSimplify tolerance and boundary must be plan-constant");
+                }
+                folded[i] = ExprUtils.analyzeAndCastFold(node.getChild(i).clone());
+                if (!(folded[i] instanceof LiteralExpr)) {
+                    throw new SemanticException("ST_CoverageSimplify parameters must fold to constants");
+                }
+            }
+            boolean nullParameter = folded[1] instanceof NullLiteral ||
+                    (argumentTypes.length == 3 && folded[2] instanceof NullLiteral);
+            if (!nullParameter) {
+                double value = ((LiteralExpr) folded[1]).getDoubleValue();
+                if (!Double.isFinite(value) || value < 0 || !Double.isFinite(value * value)) {
+                    throw new SemanticException("ST_CoverageSimplify requires finite nonnegative tolerance " +
+                            "and representable tolerance squared");
+                }
+            }
+            fn = ExprUtils.getBuiltinFunction(fnName, argumentTypes, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+            if (fn != null) {
+                fn = fn.copy();
+                fn.setRetType(argumentTypes[0]);
+            }
+        } else if ((FunctionSet.ST_BUFFER.equalsIgnoreCase(fnName) ||
+                FunctionSet.ST_SIMPLIFY_PRESERVE_TOPOLOGY.equalsIgnoreCase(fnName)) && argumentTypes.length == 2 &&
+                argumentTypes[0].getPrimitiveType() == PrimitiveType.GEOMETRY) {
+            GeoTypeDescriptor descriptor = ((ScalarType) argumentTypes[0]).getGeoDescriptor();
+            if (descriptor == null) {
+                throw new SemanticException("%s requires a GEOMETRY CRS descriptor", fnName);
+            }
+            fn = ExprUtils.getBuiltinFunction(fnName, argumentTypes, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+            if (fn != null) {
+                fn = fn.copy();
+                fn.setRetType(argumentTypes[0]);
+            }
+        } else if ((FunctionSet.ST_INTERSECTION.equalsIgnoreCase(fnName) ||
+                FunctionSet.ST_UNION.equalsIgnoreCase(fnName) ||
+                FunctionSet.ST_DIFFERENCE.equalsIgnoreCase(fnName) ||
+                FunctionSet.ST_SYMDIFFERENCE.equalsIgnoreCase(fnName)) && argumentTypes.length == 2 &&
+                ((argumentTypes[0].getPrimitiveType() == PrimitiveType.GEOMETRY &&
+                        (argumentTypes[1].isNull() || argumentTypes[1].getPrimitiveType() == PrimitiveType.GEOMETRY)) ||
+                        (argumentTypes[0].isNull() && argumentTypes[1].getPrimitiveType() == PrimitiveType.GEOMETRY))) {
+            Type resultType = argumentTypes[0].isNull() ? argumentTypes[1] : argumentTypes[0];
+            GeoTypeDescriptor left = ((ScalarType) resultType).getGeoDescriptor();
+            GeoTypeDescriptor right = argumentTypes[1].isNull() ? left :
+                    ((ScalarType) argumentTypes[1]).getGeoDescriptor();
+            if (left == null || right == null || !left.isSemanticallyCompatible(right)) {
+                throw new SemanticException("%s requires compatible GEOMETRY CRS descriptors", fnName);
+            }
+            fn = ExprUtils.getBuiltinFunction(fnName, argumentTypes, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+            if (fn != null) {
+                fn = fn.copy();
+                fn.setRetType(resultType);
+            }
+        } else if ((FunctionSet.ST_SETSRID.equalsIgnoreCase(fnName) ||
+                FunctionSet.ST_TRANSFORM.equalsIgnoreCase(fnName)) && argumentTypes.length == 2 &&
+                argumentTypes[0].getPrimitiveType() == PrimitiveType.GEOMETRY) {
+            Expr sridExpr = node.getChild(1);
+            if (!sridExpr.isConstant()) {
+                throw new SemanticException("%s requires a foldable constant target SRID", fnName);
+            }
+            Expr folded = ExprUtils.analyzeAndCastFold(sridExpr.clone());
+            // Check the original folded integer before narrowing LARGEINT to an INT SRID.
+            BigInteger value = toBigInteger(folded);
+            if (value == null || value.signum() <= 0 || value.compareTo(BigInteger.valueOf(Integer.MAX_VALUE)) > 0) {
+                throw new SemanticException("%s requires a positive INT target SRID", fnName);
+            }
+            int targetSrid = value.intValueExact();
+            if (targetSrid != 4326 && targetSrid != 3857) {
+                throw new SemanticException("%s supports only EPSG:4326 and EPSG:3857", fnName);
+            }
+            fn = ExprUtils.getBuiltinFunction(fnName, argumentTypes, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+            if (fn != null) {
+                IntLiteral target = new IntLiteral(targetSrid, IntegerType.INT);
+                node.getParams().exprs().set(1, target);
+                node.setChild(1, target);
+                fn = fn.copy();
+                fn.setRetType(ScalarType.createGeoType(PrimitiveType.GEOMETRY,
+                        GeoTypeDescriptor.geometry("EPSG:" + targetSrid)));
+            }
+        } else if ("st_geogfromtext".equalsIgnoreCase(fnName) || "st_geogfromwkb".equalsIgnoreCase(fnName) ||
+                FunctionSet.H3_TOBOUNDARY.equalsIgnoreCase(fnName)) {
+            // These producers have a fixed CRS84 result, which must be concrete before planning.
+            fn = ExprUtils.getBuiltinFunction(fnName, argumentTypes, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+            if (fn != null) {
+                fn = fn.copy();
+                fn.setRetType(ScalarType.createGeoType(PrimitiveType.GEOGRAPHY,
+                        new GeoTypeDescriptor(GeoTypeDescriptor.LogicalType.GEOGRAPHY,
+                                GeoTypeDescriptor.CoordinateSystem.SPHERICAL,
+                                GeoTypeDescriptor.EdgeAlgorithm.SPHERICAL, "OGC:CRS84", 4326)));
+            }
+        } else if (FunctionSet.ST_CENTROID.equalsIgnoreCase(fnName) && argumentTypes.length == 1 &&
+                (argumentTypes[0].getPrimitiveType() == PrimitiveType.GEOGRAPHY ||
+                        argumentTypes[0].getPrimitiveType() == PrimitiveType.GEOMETRY)) {
+            fn = ExprUtils.getBuiltinFunction(fnName, argumentTypes, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+            if (fn != null) {
+                fn = fn.copy();
+                fn.setRetType(argumentTypes[0]);
+            }
+        } else if ((FunctionSet.ST_GEOMFROMTEXT.equalsIgnoreCase(fnName) ||
+                FunctionSet.ST_GEOMFROMWKB.equalsIgnoreCase(fnName)) && argumentTypes.length == 2) {
+            if (!(node.getChild(1) instanceof StringLiteral)) {
+                throw new SemanticException("%s requires CRS to be a non-empty string literal", fnName);
+            }
+            String crs = ((StringLiteral) node.getChild(1)).getStringValue();
+            if (crs.isEmpty()) {
+                throw new SemanticException("%s requires CRS to be a non-empty string literal", fnName);
+            }
+            fn = ExprUtils.getBuiltinFunction(fnName, argumentTypes,
+                    Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+            if (fn != null) {
+                fn = fn.copy();
+                fn.setRetType(ScalarType.createGeoType(PrimitiveType.GEOMETRY, GeoTypeDescriptor.geometry(crs)));
+            }
         } else if (FunctionSet.CONCAT.equals(fnName) && node.getChildren().stream().anyMatch(child ->
                 child.getType().isArrayType())) {
             List<Type> arrayTypes = Arrays.stream(argumentTypes).map(argumentType -> {
@@ -1126,6 +1340,10 @@ public class FunctionAnalyzer {
                         fnName.replace(FeConstants.ICEBERG_TRANSFORM_EXPRESSION_PREFIX, ""),
                         Arrays.stream(argumentTypes).map(Type::toSql).collect(Collectors.joining(", ")));
             }
+            // the resolved builtin is a shared singleton: mutate a copy, or the wildcard decimal
+            // signature gets stamped with a concrete (precision, scale) and later lookups with a
+            // different scale fail until the FE restarts
+            fn = fn.copy();
             if (args[0].isDecimalV3()) {
                 fn.setArgsType(args);
             }

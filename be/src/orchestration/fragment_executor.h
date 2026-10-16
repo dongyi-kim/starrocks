@@ -27,17 +27,23 @@
 #include "runtime/exec_env_fwd.h"
 
 namespace starrocks {
+class BatchWriteMgr;
 class RuntimeState;
 
 namespace orchestration {
 
 class FragmentExecutor {
 public:
-    FragmentExecutor();
+    explicit FragmentExecutor(BatchWriteMgr* batch_write_mgr = nullptr);
+    void set_batch_write_mgr(BatchWriteMgr* batch_write_mgr) { _batch_write_mgr = batch_write_mgr; }
 
     Status prepare(ExecEnv* exec_env, const TExecPlanFragmentParams& common_request,
                    const TExecPlanFragmentParams& unique_request);
     Status execute(ExecEnv* exec_env);
+
+    // Exposes the prepared FragmentContext so a BE-local caller (stream load) can
+    // install a finish callback before execute(). Valid only after prepare() succeeds.
+    pipeline::FragmentContextPtr fragment_ctx() const { return _fragment_ctx; }
 
     static Status append_incremental_scan_ranges(ExecEnv* exec_env, const TExecPlanFragmentParams& request,
                                                  TExecPlanFragmentResult* response);
@@ -52,6 +58,17 @@ public:
     // _prepare_exec_plan / append_incremental_scan_ranges, not this entry point.
     static Status add_scan_ranges_partition_values(RuntimeState* runtime_state,
                                                    const std::vector<TScanRangeParams>& scan_ranges);
+
+    // Returns true if this output sink type terminates the query plan, so the fragment must
+    // classify its QueryContext via set_final_sink(). The sink operators of such fragments
+    // report audit statistics through QueryContext::final_query_statistic(), which requires
+    // (and DCHECKs) the final-sink classification. In particular, every sink type that
+    // decomposes to a ConnectorSinkOperator (Iceberg / Hive / table-function file sinks)
+    // must be listed.
+    //
+    // Exposed here so unit tests can pin the contract; the production caller is
+    // _prepare_pipeline_driver.
+    static bool is_final_sink_type(TDataSinkType::type type);
 
     Status prepare_global_state(ExecEnv* exec_env, const TExecPlanFragmentParams& common_request);
     void _fail_cleanup(bool fragment_has_registed);
@@ -82,6 +99,7 @@ private:
     bool _is_in_colocate_exec_group(PlanNodeId plan_node_id);
 
     int64_t _fragment_start_time = 0;
+    BatchWriteMgr* _batch_write_mgr = nullptr;
     pipeline::QueryContextManager* _query_ctx_mgr = nullptr;
     pipeline::QueryContext* _query_ctx = nullptr;
     // Pin the QueryContext alive for at least as long as `_fragment_ctx`.
